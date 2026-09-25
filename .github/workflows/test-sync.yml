@@ -19,7 +19,7 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: Iniciar backend y sincronizar
+      - name: Diagnosticar backend
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -33,36 +33,17 @@ jobs:
 
           SERVER_PID=$!
 
+          echo "PID: $SERVER_PID"
+
           sleep 5
 
-          echo "=== COMPROBANDO BACKEND ==="
-          curl -f http://127.0.0.1:8000/health
+          echo "=== PROCESO UVICORN ==="
+          ps aux | grep uvicorn || true
 
-          echo ""
-          echo "=== SINCRONIZANDO LA LIGA ==="
+          echo "=== LOG COMPLETO ==="
+          cat server.log || true
 
-          HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" \
-            "http://127.0.0.1:8000/sync/league?league=140&season=2025")
+          echo "=== PRUEBA HEALTH ==="
+          curl -v http://127.0.0.1:8000/health || true
 
-          echo "Código HTTP: $HTTP_CODE"
-
-          echo "=== RESPUESTA ==="
-          cat response.json
-
-          echo ""
-          echo "=== LOG DEL BACKEND ==="
-          cat server.log
-
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo ""
-            echo "========================================"
-            echo "SINCRONIZACION EXITOSA"
-            echo "API-FOOTBALL -> BACKEND -> SUPABASE"
-            echo "========================================"
-          else
-            echo ""
-            echo "ERROR EN LA SINCRONIZACION"
-            exit 1
-          fi
-
-          kill $SERVER_PID || true
+          echo "=== FIN DEL DIAGNOSTICO ==="
