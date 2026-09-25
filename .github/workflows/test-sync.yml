@@ -19,13 +19,13 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: Diagnosticar backend
+      - name: Iniciar backend y sincronizar
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: |
-          echo "=== INICIANDO UVICORN ==="
+          echo "=== INICIANDO BACKEND ==="
 
           python -m uvicorn app.main:app \
             --host 127.0.0.1 \
@@ -33,19 +33,36 @@ jobs:
 
           SERVER_PID=$!
 
-          echo "PID DEL BACKEND: $SERVER_PID"
-
           sleep 5
 
-          echo "=== PROCESO ==="
-          ps aux | grep uvicorn || true
+          echo "=== COMPROBANDO BACKEND ==="
+          curl -f http://127.0.0.1:8000/health
 
-          echo "=== LOG COMPLETO DEL BACKEND ==="
-          cat server.log || true
+          echo ""
+          echo "=== SINCRONIZANDO LA LIGA ==="
 
-          echo "=== FIN DEL LOG ==="
+          HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" \
+            "http://127.0.0.1:8000/sync/league?league=140&season=2025")
 
-          echo "=== PROBANDO PUERTO 8000 ==="
-          curl -v http://127.0.0.1:8000/health || true
+          echo "Código HTTP: $HTTP_CODE"
 
-          echo "=== DIAGNOSTICO TERMINADO ==="
+          echo "=== RESPUESTA ==="
+          cat response.json
+
+          echo ""
+          echo "=== LOG DEL BACKEND ==="
+          cat server.log
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo ""
+            echo "========================================"
+            echo "SINCRONIZACION EXITOSA"
+            echo "API-FOOTBALL -> BACKEND -> SUPABASE"
+            echo "========================================"
+          else
+            echo ""
+            echo "ERROR EN LA SINCRONIZACION"
+            exit 1
+          fi
+
+          kill $SERVER_PID || true
