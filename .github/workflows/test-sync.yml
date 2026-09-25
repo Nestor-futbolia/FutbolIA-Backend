@@ -1,10 +1,10 @@
-name: Diagnosticar backend Fútbol IA
+name: Sincronizar API-Football a Supabase
 
 on:
   workflow_dispatch:
 
 jobs:
-  diagnostico:
+  sync:
     runs-on: ubuntu-latest
 
     steps:
@@ -19,16 +19,7 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: Verificar importación
-        env:
-          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-        run: |
-          echo "=== PROBANDO IMPORTACION ==="
-          python -c "from app.main import app; print('IMPORTACION OK')"
-
-      - name: Probar backend
+      - name: Iniciar backend
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -49,10 +40,36 @@ jobs:
           echo "=== LOG DEL BACKEND ==="
           cat server.log
 
-          echo "=== PROBANDO HEALTH ==="
+          echo "=== COMPROBANDO HEALTH ==="
           curl -f http://127.0.0.1:8000/health
 
           echo ""
-          echo "=== BACKEND FUNCIONA CORRECTAMENTE ==="
+          echo "=== BACKEND LISTO ==="
+
+          echo "=== SINCRONIZANDO LA LIGA ESPAÑOLA ==="
+
+          HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" \
+            "http://127.0.0.1:8000/sync/league?league=140&season=2025")
+
+          echo "Código HTTP: $HTTP_CODE"
+
+          echo ""
+          echo "=== RESPUESTA DEL BACKEND ==="
+          cat response.json
+
+          echo ""
+          echo "=== RESULTADO ==="
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "========================================"
+            echo "SINCRONIZACION EXITOSA"
+            echo "API-FOOTBALL -> BACKEND -> SUPABASE"
+            echo "========================================"
+          else
+            echo "========================================"
+            echo "ERROR EN LA SINCRONIZACION"
+            echo "========================================"
+            exit 1
+          fi
 
           kill $SERVER_PID || true
