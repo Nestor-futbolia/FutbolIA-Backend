@@ -28,14 +28,31 @@ jobs:
           echo "=== PROBANDO IMPORTACION ==="
           python -c "from app.main import app; print('IMPORTACION OK')"
 
-      - name: Arrancar backend
+      - name: Probar backend
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: |
-          echo "=== ARRANCANDO UVICORN ==="
+          echo "=== INICIANDO BACKEND ==="
 
           python -m uvicorn app.main:app \
             --host 127.0.0.1 \
-            --port 8000
+            --port 8000 > server.log 2>&1 &
+
+          SERVER_PID=$!
+
+          echo "PID: $SERVER_PID"
+
+          sleep 5
+
+          echo "=== LOG DEL BACKEND ==="
+          cat server.log
+
+          echo "=== PROBANDO HEALTH ==="
+          curl -f http://127.0.0.1:8000/health
+
+          echo ""
+          echo "=== BACKEND FUNCIONA CORRECTAMENTE ==="
+
+          kill $SERVER_PID || true
