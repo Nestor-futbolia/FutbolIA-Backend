@@ -61,7 +61,7 @@ async def football_get(
 @app.get("/")
 async def root():
     return {
-        "app": "Fútbol IA 2.0",
+        "app": "Fútbol IA 2.0 API",
         "status": "online",
         "provider": "API-Football",
         "utc": datetime.now(timezone.utc).isoformat()
@@ -201,14 +201,20 @@ async def odds(
     if season:
         params["season"] = season
 
+    if not params:
+        raise HTTPException(
+            status_code=400,
+            detail="Indica fixture, league o season"
+        )
+
     return await football_get("/odds", params)
-    
-    @app.get("/sync/league")
+
+
+@app.get("/sync/league")
 async def sync_league(
     league: int,
     season: int
 ):
-    # Obtener la liga desde API-Football
     data = await football_get(
         "/leagues",
         {
@@ -236,7 +242,6 @@ async def sync_league(
         "active": True
     }
 
-    # Guardar/actualizar en Supabase
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_SECRET_KEY")
 
