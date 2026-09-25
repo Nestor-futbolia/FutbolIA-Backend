@@ -14,35 +14,28 @@ jobs:
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Instalar dependencias
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-        - name: Diagnosticar backend
+      - name: Diagnosticar backend
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: |
-          echo "Iniciando Uvicorn..."
-
-          python -m uvicorn app.main:app \
-            --host 127.0.0.1 \
-            --port 8000 > server.log 2>&1 &
-
+          echo "Iniciando backend..."
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > server.log 2>&1 &
           SERVER_PID=$!
 
+          echo "Esperando al backend..."
           sleep 5
 
           echo "=== LOG DEL BACKEND ==="
           cat server.log
 
-          echo "=== COMPROBANDO PROCESO ==="
-          ps -p $SERVER_PID || true
-
-          echo "=== COMPROBANDO PUERTO 8000 ==="
+          echo "=== PROBANDO HEALTH ==="
           curl -v http://127.0.0.1:8000/health
 
           echo "=== BACKEND FUNCIONA ==="
