@@ -44,6 +44,6 @@ jobs:
           cat server.log || true
 
           echo "=== PRUEBA HEALTH ==="
-          curl -v http://127.0.0.1:8000/health || true
+          curl -v http://127.0.0.1:8000/health
 
           echo "=== FIN DEL DIAGNOSTICO ==="
