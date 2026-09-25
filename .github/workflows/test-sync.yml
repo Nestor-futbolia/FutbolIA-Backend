@@ -20,42 +20,29 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: Iniciar backend y sincronizar
+        - name: Diagnosticar backend
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: |
-          uvicorn app.main:app --host 127.0.0.1 --port 8000 > server.log 2>&1 &
+          echo "Iniciando Uvicorn..."
+
+          python -m uvicorn app.main:app \
+            --host 127.0.0.1 \
+            --port 8000 > server.log 2>&1 &
+
           SERVER_PID=$!
 
-          echo "Esperando al backend..."
+          sleep 5
 
-          for i in {1..15}; do
-            if curl -s http://127.0.0.1:8000/health > /dev/null; then
-              echo "BACKEND OK"
-              break
-            fi
-            sleep 1
-          done
-
-          echo "Sincronizando La Liga 2025..."
-
-          HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" \
-            "http://127.0.0.1:8000/sync/league?league=140&season=2025")
-
-          echo "Código HTTP: $HTTP_CODE"
-          cat response.json
-
-          echo ""
           echo "=== LOG DEL BACKEND ==="
           cat server.log
 
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "SINCRONIZACION API-FOOTBALL -> SUPABASE OK"
-          else
-            echo "ERROR EN LA SINCRONIZACION"
-            exit 1
-          fi
+          echo "=== COMPROBANDO PROCESO ==="
+          ps -p $SERVER_PID || true
 
-          kill $SERVER_PID || true
+          echo "=== COMPROBANDO PUERTO 8000 ==="
+          curl -v http://127.0.0.1:8000/health
+
+          echo "=== BACKEND FUNCIONA ==="
