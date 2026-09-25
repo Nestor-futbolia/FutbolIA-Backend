@@ -202,3 +202,71 @@ async def odds(
         params["season"] = season
 
     return await football_get("/odds", params)
+    
+    @app.get("/sync/league")
+async def sync_league(
+    league: int,
+    season: int
+):
+    # Obtener la liga desde API-Football
+    data = await football_get(
+        "/leagues",
+        {
+            "id": league,
+            "season": season
+        }
+    )
+
+    if not data.get("response"):
+        raise HTTPException(
+            status_code=404,
+            detail="Liga no encontrada en API-Football"
+        )
+
+    item = data["response"][0]
+
+    league_info = item["league"]
+    country_info = item.get("country", {})
+
+    row = {
+        "id": league_info["id"],
+        "name": league_info["name"],
+        "country": country_info.get("name"),
+        "type": league_info.get("type"),
+        "active": True
+    }
+
+    # Guardar/actualizar en Supabase
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SECRET_KEY")
+
+    if not supabase_url or not supabase_key:
+        raise HTTPException(
+            status_code=503,
+            detail="SUPABASE_URL o SUPABASE_SECRET_KEY no configurada"
+        )
+
+    headers = {
+        "apikey": supabase_key,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates"
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            f"{supabase_url}/rest/v1/leagues",
+            headers=headers,
+            json=row
+        )
+
+    if response.status_code >= 300:
+        raise HTTPException(
+            status_code=502,
+            detail=response.text[:1000]
+        )
+
+    return {
+        "ok": True,
+        "message": "Liga sincronizada correctamente",
+        "league": row
+    }
