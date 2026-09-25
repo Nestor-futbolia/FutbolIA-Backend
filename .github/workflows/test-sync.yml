@@ -25,17 +25,27 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: |
-          echo "Iniciando backend..."
-          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > server.log 2>&1 &
+          echo "=== INICIANDO UVICORN ==="
+
+          python -m uvicorn app.main:app \
+            --host 127.0.0.1 \
+            --port 8000 > server.log 2>&1 &
+
           SERVER_PID=$!
 
-          echo "Esperando al backend..."
+          echo "PID DEL BACKEND: $SERVER_PID"
+
           sleep 5
 
-          echo "=== LOG DEL BACKEND ==="
-          cat server.log
+          echo "=== PROCESO ==="
+          ps aux | grep uvicorn || true
 
-          echo "=== PROBANDO HEALTH ==="
-          curl -v http://127.0.0.1:8000/health
+          echo "=== LOG COMPLETO DEL BACKEND ==="
+          cat server.log || true
 
-          echo "=== BACKEND FUNCIONA ==="
+          echo "=== FIN DEL LOG ==="
+
+          echo "=== PROBANDO PUERTO 8000 ==="
+          curl -v http://127.0.0.1:8000/health || true
+
+          echo "=== DIAGNOSTICO TERMINADO ==="
