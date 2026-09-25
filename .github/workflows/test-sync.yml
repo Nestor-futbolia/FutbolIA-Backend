@@ -1,10 +1,10 @@
-name: Probar sincronización API-Football a Supabase
+name: Diagnosticar backend Fútbol IA
 
 on:
   workflow_dispatch:
 
 jobs:
-  sync:
+  diagnostico:
     runs-on: ubuntu-latest
 
     steps:
@@ -19,31 +19,23 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: Diagnosticar backend
+      - name: Verificar importación
         env:
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: |
-          echo "=== INICIANDO BACKEND ==="
+          echo "=== PROBANDO IMPORTACION ==="
+          python -c "from app.main import app; print('IMPORTACION OK')"
+
+      - name: Arrancar backend
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          echo "=== ARRANCANDO UVICORN ==="
 
           python -m uvicorn app.main:app \
             --host 127.0.0.1 \
-            --port 8000 > server.log 2>&1 &
-
-          SERVER_PID=$!
-
-          echo "PID: $SERVER_PID"
-
-          sleep 5
-
-          echo "=== PROCESO UVICORN ==="
-          ps aux | grep uvicorn || true
-
-          echo "=== LOG COMPLETO ==="
-          cat server.log || true
-
-          echo "=== PRUEBA HEALTH ==="
-          curl -v http://127.0.0.1:8000/health
-
-          echo "=== FIN DEL DIAGNOSTICO ==="
+            --port 8000
