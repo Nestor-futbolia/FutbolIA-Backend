@@ -1,0 +1,29 @@
+name: Probar API-Football
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-api:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Probar API-Football
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+        run: |
+          echo "Probando conexión con API-Football..."
+
+          HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" \
+            -H "x-apisports-key: $API_FOOTBALL_KEY" \
+            "https://v3.football.api-sports.io/status")
+
+          echo "Código HTTP: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "CONEXION OK"
+          else
+            echo "ERROR EN LA CONEXION"
+            cat response.json
+            exit 1
+          fi
