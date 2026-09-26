@@ -1,0 +1,91 @@
+name: Probar IA Fútbol IA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-ai:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+
+      - name: Comprobar importacion de IA
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          python - <<'PY'
+          import asyncio
+
+          from app.ai_predict import load_active_model
+
+          async def main():
+              model = await load_active_model()
+
+              print("========================================")
+              print("MODELO IA ENCONTRADO")
+              print("========================================")
+              print("Version:", model.get("version"))
+              print("Nombre:", model.get("model_name"))
+              print("Entrenado:", model.get("trained_at"))
+              print(
+                  "Partidos:",
+                  model.get("training_matches")
+              )
+
+          asyncio.run(main())
+          PY
+
+      - name: Levantar backend
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+        run: |
+          nohup uvicorn app.main:app \
+            --host 127.0.0.1 \
+            --port 8000 \
+            > server.log 2>&1 &
+
+          echo $! > server.pid
+
+          sleep 5
+
+      - name: Probar health
+        run: |
+          curl --fail \
+            http://127.0.0.1:8000/health
+
+      - name: Probar estado de IA
+        run: |
+          echo "========================================"
+          echo "ESTADO DE LA IA"
+          echo "========================================"
+
+          curl --fail \
+            http://127.0.0.1:8000/ai/status
+
+      - name: Mostrar logs
+        if: always()
+        run: |
+          echo "========================================"
+          echo "LOGS DEL SERVIDOR"
+          echo "========================================"
+
+          cat server.log || true
+
+      - name: Detener backend
+        if: always()
+        run: |
+          kill $(cat server.pid) || true
