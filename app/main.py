@@ -11,11 +11,10 @@ from app.ai_evaluate import router as ai_evaluate_router
 
 app = FastAPI(
     title="Fútbol IA 2.0 API",
-    version="0.8.1"
+    version="0.8.2"
 )
 
 app.include_router(ai_evaluate_router)
-
 
 BASE_URL = "https://v3.football.api-sports.io"
 
@@ -25,7 +24,10 @@ BASE_URL = "https://v3.football.api-sports.io"
 # ============================================================
 
 def get_api_football_key() -> str:
-    key = os.getenv("API_FOOTBALL_KEY", "").strip()
+    key = os.getenv(
+        "API_FOOTBALL_KEY",
+        ""
+    ).strip()
 
     if not key:
         raise RuntimeError(
@@ -36,7 +38,6 @@ def get_api_football_key() -> str:
 
 
 def get_supabase_config() -> tuple[str, str]:
-
     url = os.getenv(
         "SUPABASE_URL",
         ""
@@ -118,6 +119,7 @@ async def football_get(
         )
 
     try:
+
         data = response.json()
 
     except Exception:
@@ -294,6 +296,7 @@ def safe_int(
         return int(value)
 
     except Exception:
+
         return default
 
 
@@ -310,6 +313,7 @@ def safe_float(
         return float(value)
 
     except Exception:
+
         return default
 
 
@@ -335,7 +339,7 @@ async def root():
     return {
         "ok": True,
         "app": "Fútbol IA 2.0",
-        "version": "0.8.1",
+        "version": "0.8.2",
         "message": "Backend funcionando"
     }
 
@@ -347,7 +351,7 @@ async def health():
         "ok": True,
         "status": "healthy",
         "app": "Fútbol IA 2.0",
-        "version": "0.8.1",
+        "version": "0.8.2",
         "time": utc_now()
     }
 
@@ -637,10 +641,7 @@ async def sync_league(
             "year"
         ) == season:
 
-            selected_season = (
-                season_info
-            )
-
+            selected_season = season_info
             break
 
     if selected_season is None:
@@ -664,15 +665,11 @@ async def sync_league(
         "id": season_id,
         "league_id": league_id,
         "name": str(season),
-        "starting_at": (
-            selected_season.get(
-                "start"
-            )
+        "starting_at": selected_season.get(
+            "start"
         ),
-        "ending_at": (
-            selected_season.get(
-                "end"
-            )
+        "ending_at": selected_season.get(
+            "end"
         )
     }
 
@@ -767,9 +764,7 @@ async def sync_teams(
         "ok": True,
         "league": league,
         "season": season,
-        "teams_received": len(
-            response
-        ),
+        "teams_received": len(response),
         "teams_saved": saved
     }
 
@@ -806,9 +801,7 @@ async def sync_fixtures(
 
         raise HTTPException(
             status_code=404,
-            detail=(
-                "No se encontraron fixtures"
-            )
+            detail="No se encontraron fixtures"
         )
 
     saved = 0
@@ -933,26 +926,14 @@ async def sync_fixtures(
         "ok": True,
         "league": league,
         "season": season,
-        "fixtures_received": len(
-            response
-        ),
+        "fixtures_received": len(response),
         "fixtures_saved": saved,
         "fixtures_skipped": skipped
     }
 
 
 # ============================================================
-# NUEVO — SINCRONIZAR PRÓXIMOS PARTIDOS
-#
-# IMPORTANTE:
-# NO usamos ?next= porque el plan gratuito
-# de API-Football lo rechaza.
-#
-# Usamos:
-#   date=HOY
-#   date=MAÑANA
-#
-# Son solamente 2 llamadas.
+# SINCRONIZAR PRÓXIMOS PARTIDOS
 # ============================================================
 
 @app.get("/sync/upcoming")
@@ -1021,7 +1002,6 @@ async def sync_upcoming(
                     item
                 )
 
-    # Ordenar por hora de inicio
     all_future_fixtures.sort(
         key=lambda item: (
             parse_api_date(
@@ -1038,7 +1018,6 @@ async def sync_upcoming(
         )
     )
 
-    # Evitar duplicados
     unique_fixtures = []
     seen_ids = set()
 
@@ -1096,18 +1075,6 @@ async def sync_upcoming(
             "id"
         )
 
-        league_name = league_info.get(
-            "name"
-        )
-
-        country_name = league_info.get(
-            "country"
-        )
-
-        league_type = league_info.get(
-            "type"
-        )
-
         season_year = league_info.get(
             "season"
         )
@@ -1141,129 +1108,115 @@ async def sync_upcoming(
             skipped += 1
             continue
 
-        # ----------------------------------------------------
-        # LIGA
-        # ----------------------------------------------------
-
-        league_payload = {
-            "id": league_id,
-            "name": league_name,
-            "country": country_name,
-            "type": league_type,
-            "active": True
-        }
+        # Liga
 
         await supabase_upsert(
             "leagues",
-            league_payload,
+            {
+                "id": league_id,
+                "name": league_info.get(
+                    "name"
+                ),
+                "country": league_info.get(
+                    "country"
+                ),
+                "type": league_info.get(
+                    "type"
+                ),
+                "active": True
+            },
             "id"
         )
 
-        # ----------------------------------------------------
-        # TEMPORADA
-        # ----------------------------------------------------
+        # Temporada
 
         season_id = (
             league_id * 10000
             + season_year
         )
 
-        season_payload = {
-            "id": season_id,
-            "league_id": league_id,
-            "name": str(
-                season_year
-            )
-        }
-
         await supabase_upsert(
             "seasons",
-            season_payload,
+            {
+                "id": season_id,
+                "league_id": league_id,
+                "name": str(
+                    season_year
+                )
+            },
             "id"
         )
 
-        # ----------------------------------------------------
-        # EQUIPO LOCAL
-        # ----------------------------------------------------
-
-        home_payload = {
-            "id": home_team_id,
-            "name": home_team.get(
-                "name"
-            ),
-            "short_code": home_team.get(
-                "code"
-            ),
-            "country": home_team.get(
-                "country"
-            ),
-            "venue_name": None,
-            "league_id": league_id
-        }
+        # Equipo local
 
         await supabase_upsert(
             "teams",
-            home_payload,
+            {
+                "id": home_team_id,
+                "name": home_team.get(
+                    "name"
+                ),
+                "short_code": home_team.get(
+                    "code"
+                ),
+                "country": home_team.get(
+                    "country"
+                ),
+                "venue_name": None,
+                "league_id": league_id
+            },
             "id"
         )
 
-        # ----------------------------------------------------
-        # EQUIPO VISITANTE
-        # ----------------------------------------------------
-
-        away_payload = {
-            "id": away_team_id,
-            "name": away_team.get(
-                "name"
-            ),
-            "short_code": away_team.get(
-                "code"
-            ),
-            "country": away_team.get(
-                "country"
-            ),
-            "venue_name": None,
-            "league_id": league_id
-        }
+        # Equipo visitante
 
         await supabase_upsert(
             "teams",
-            away_payload,
+            {
+                "id": away_team_id,
+                "name": away_team.get(
+                    "name"
+                ),
+                "short_code": away_team.get(
+                    "code"
+                ),
+                "country": away_team.get(
+                    "country"
+                ),
+                "venue_name": None,
+                "league_id": league_id
+            },
             "id"
         )
 
-        # ----------------------------------------------------
-        # PARTIDO
-        # ----------------------------------------------------
+        # Partido
 
         status_info = fixture_info.get(
             "status",
             {}
         )
 
-        payload = {
-            "id": fixture_id,
-            "league_id": league_id,
-            "season_id": season_id,
-            "home_team_id": home_team_id,
-            "away_team_id": away_team_id,
-            "referee_id": None,
-            "starting_at": fixture_info.get(
-                "date"
-            ),
-            "status": status_info.get(
-                "short"
-            ),
-            "home_goals": None,
-            "away_goals": None,
-            "home_ht_goals": None,
-            "away_ht_goals": None,
-            "updated_at": utc_now()
-        }
-
         await supabase_upsert(
             "matches",
-            payload,
+            {
+                "id": fixture_id,
+                "league_id": league_id,
+                "season_id": season_id,
+                "home_team_id": home_team_id,
+                "away_team_id": away_team_id,
+                "referee_id": None,
+                "starting_at": fixture_info.get(
+                    "date"
+                ),
+                "status": status_info.get(
+                    "short"
+                ),
+                "home_goals": None,
+                "away_goals": None,
+                "home_ht_goals": None,
+                "away_ht_goals": None,
+                "updated_at": utc_now()
+            },
             "id"
         )
 
@@ -1393,17 +1346,15 @@ async def sync_statistics(
 
                     text_value = value
 
-            payload = {
-                "match_id": fixture,
-                "team_id": team_id,
-                "stat_type": stat_type,
-                "value_numeric": numeric_value,
-                "value_text": text_value
-            }
-
             await supabase_upsert(
                 "match_statistics",
-                payload,
+                {
+                    "match_id": fixture,
+                    "team_id": team_id,
+                    "stat_type": stat_type,
+                    "value_numeric": numeric_value,
+                    "value_text": text_value
+                },
                 "match_id,team_id,stat_type"
             )
 
@@ -1671,7 +1622,10 @@ async def ai_status():
 
 
 # ============================================================
-# IA — PREDICCIÓN 1X2
+# IA — PREDICCIÓN INDIVIDUAL 1X2
+#
+# IMPORTANTE:
+# Esta ruta va DESPUÉS de /ai/predict/upcoming.
 # ============================================================
 
 @app.get("/ai/predict/{match_id}")
@@ -1693,3 +1647,385 @@ async def ai_predict(
             status_code=400,
             detail=str(exc)
         )
+
+
+# ============================================================
+# IA — PREDICCIONES PRÓXIMAS
+#
+# ESTA ES LA RUTA QUE USA LA APK.
+#
+# Si las predicciones ya existen en Supabase:
+#     NO las vuelve a crear.
+#     Las LEE y las devuelve.
+#
+# Si faltan:
+#     las genera mediante predict_match()
+#     y después vuelve a leerlas.
+# ============================================================
+
+@app.get("/ai/predict/upcoming")
+async def ai_predict_upcoming(
+    limit: int = 10
+):
+
+    if limit < 1 or limit > 20:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "El límite debe estar "
+                "entre 1 y 20"
+            )
+        )
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    # --------------------------------------------------------
+    # Buscar próximos partidos guardados.
+    # --------------------------------------------------------
+
+    matches = await supabase_get(
+        "matches",
+        {
+            "select": (
+                "id,"
+                "starting_at,"
+                "status,"
+                "home_team_id,"
+                "away_team_id"
+            ),
+            "starting_at": (
+                f"gt.{now.isoformat()}"
+            ),
+            "order": "starting_at.asc",
+            "limit": str(limit)
+        }
+    )
+
+    if not matches:
+
+        return {
+            "ok": True,
+            "current_time_utc": now.isoformat(),
+            "selected": 0,
+            "predicted": 0,
+            "skipped": 0,
+            "failed": 0,
+            "details": []
+        }
+
+    match_ids = [
+        int(match["id"])
+        for match in matches
+        if match.get("id") is not None
+    ]
+
+    if not match_ids:
+
+        return {
+            "ok": True,
+            "current_time_utc": now.isoformat(),
+            "selected": 0,
+            "predicted": 0,
+            "skipped": 0,
+            "failed": 0,
+            "details": []
+        }
+
+    ids_filter = ",".join(
+        str(match_id)
+        for match_id in match_ids
+    )
+
+    # --------------------------------------------------------
+    # Función interna para cargar predicciones existentes.
+    # --------------------------------------------------------
+
+    async def load_existing_predictions():
+
+        rows = await supabase_get(
+            "predictions",
+            {
+                "select": (
+                    "id,"
+                    "match_id,"
+                    "model_version,"
+                    "market,"
+                    "selection,"
+                    "probability,"
+                    "predicted_at"
+                ),
+                "match_id": (
+                    f"in.({ids_filter})"
+                ),
+                "market": "eq.1X2",
+                "order": "predicted_at.desc",
+                "limit": "1000"
+            }
+        )
+
+        latest = {}
+
+        for row in rows:
+
+            match_id = row.get(
+                "match_id"
+            )
+
+            selection = row.get(
+                "selection"
+            )
+
+            if (
+                match_id is None
+                or selection is None
+            ):
+                continue
+
+            key = (
+                int(match_id),
+                str(selection).upper()
+            )
+
+            if key not in latest:
+
+                latest[key] = row
+
+        return latest
+
+    # --------------------------------------------------------
+    # PRIMERO: leer las predicciones que YA EXISTEN.
+    # --------------------------------------------------------
+
+    latest_predictions = (
+        await load_existing_predictions()
+    )
+
+    generated = 0
+    failed = 0
+
+    # --------------------------------------------------------
+    # SEGUNDO: generar solamente las que faltan.
+    # --------------------------------------------------------
+
+    for match in matches:
+
+        match_id = int(
+            match["id"]
+        )
+
+        home_exists = (
+            (match_id, "HOME")
+            in latest_predictions
+        )
+
+        draw_exists = (
+            (match_id, "DRAW")
+            in latest_predictions
+        )
+
+        away_exists = (
+            (match_id, "AWAY")
+            in latest_predictions
+        )
+
+        complete = (
+            home_exists
+            and draw_exists
+            and away_exists
+        )
+
+        if complete:
+            continue
+
+        try:
+
+            await predict_match(
+                match_id
+            )
+
+            generated += 1
+
+        except Exception:
+
+            failed += 1
+
+    # --------------------------------------------------------
+    # TERCERO: volver a leer Supabase.
+    #
+    # Esto es importante porque predict_match()
+    # acaba de guardar las filas nuevas.
+    # --------------------------------------------------------
+
+    latest_predictions = (
+        await load_existing_predictions()
+    )
+
+    # --------------------------------------------------------
+    # CUARTO: construir respuesta para la APK.
+    # --------------------------------------------------------
+
+    details = []
+
+    for match in matches:
+
+        match_id = int(
+            match["id"]
+        )
+
+        home_row = latest_predictions.get(
+            (match_id, "HOME")
+        )
+
+        draw_row = latest_predictions.get(
+            (match_id, "DRAW")
+        )
+
+        away_row = latest_predictions.get(
+            (match_id, "AWAY")
+        )
+
+        # Si no existen las tres probabilidades,
+        # no enviamos un resultado falso.
+        if not (
+            home_row
+            and draw_row
+            and away_row
+        ):
+
+            failed += 1
+
+            details.append({
+                "match_id": match_id,
+                "starting_at": match.get(
+                    "starting_at"
+                ),
+                "ok": False,
+                "status": "missing_predictions",
+                "reason": (
+                    "No existen las tres "
+                    "predicciones 1X2"
+                )
+            })
+
+            continue
+
+        home_probability = safe_float(
+            home_row.get(
+                "probability"
+            ),
+            0.0
+        ) or 0.0
+
+        draw_probability = safe_float(
+            draw_row.get(
+                "probability"
+            ),
+            0.0
+        ) or 0.0
+
+        away_probability = safe_float(
+            away_row.get(
+                "probability"
+            ),
+            0.0
+        ) or 0.0
+
+        probabilities = {
+            "HOME": home_probability,
+            "DRAW": draw_probability,
+            "AWAY": away_probability
+        }
+
+        prediction = max(
+            probabilities,
+            key=probabilities.get
+        )
+
+        prediction_probability = (
+            probabilities[prediction]
+        )
+
+        model_version = (
+            home_row.get(
+                "model_version"
+            )
+            or draw_row.get(
+                "model_version"
+            )
+            or away_row.get(
+                "model_version"
+            )
+            or "N/D"
+        )
+
+        details.append({
+            "match_id": match_id,
+            "starting_at": match.get(
+                "starting_at"
+            ),
+            "ok": True,
+            "status": "predicted",
+
+            "prediction": prediction,
+
+            "prediction_probability": round(
+                prediction_probability,
+                6
+            ),
+
+            "prediction_percentage": round(
+                prediction_probability * 100,
+                2
+            ),
+
+            "probabilities": {
+                "home": round(
+                    home_probability,
+                    6
+                ),
+                "draw": round(
+                    draw_probability,
+                    6
+                ),
+                "away": round(
+                    away_probability,
+                    6
+                )
+            },
+
+            "percentages": {
+                "home": round(
+                    home_probability * 100,
+                    2
+                ),
+                "draw": round(
+                    draw_probability * 100,
+                    2
+                ),
+                "away": round(
+                    away_probability * 100,
+                    2
+                )
+            },
+
+            "model_version": model_version
+        })
+
+    predicted_count = sum(
+        1
+        for item in details
+        if item.get("ok") is True
+    )
+
+    return {
+        "ok": True,
+        "current_time_utc": now.isoformat(),
+        "selected": len(matches),
+        "predicted": predicted_count,
+        "skipped": 0,
+        "failed": failed,
+        "details": details
+    }
