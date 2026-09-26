@@ -1,38 +1,846 @@
-name: Entrenar IA Futbol IA
+import json
+import os
+from collections import defaultdict, deque
+from datetime import datetime, timezone
 
-on:
-  workflow_dispatch:
+import httpx
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, log_loss
+from sklearn.preprocessing import StandardScaler
 
-jobs:
-  train:
-    runs-on: ubuntu-latest
 
-    steps:
-      - name: Descargar codigo
-        uses: actions/checkout@v4
+# ============================================================
+# CONFIGURACION
+# ============================================================
 
-      - name: Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
 
-      - name: Instalar dependencias
-        run: |
-          pip install -r requirements.txt
+WINDOW = 5
 
-      - name: Entrenar modelo
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-        run: |
-          echo "========================================"
-          echo "FUTBOL IA"
-          echo "ENTRENAMIENTO DEL MODELO 1X2"
-          echo "========================================"
+FEATURE_NAMES = [
+    "home_goals_for_5",
+    "home_goals_against_5",
+    "home_points_5",
+    "away_goals_for_5",
+    "away_goals_against_5",
+    "away_points_5",
+    "goals_form_difference",
+    "points_form_difference",
+    "home_advantage",
+]
 
-          python app/train_ai.py
 
-          echo ""
-          echo "========================================"
-          echo "ENTRENAMIENTO TERMINADO"
-          echo "========================================"
+# ============================================================
+# VALIDACION DE CONFIGURACION
+# ============================================================
+
+if not SUPABASE_URL:
+    raise RuntimeError("Falta SUPABASE_URL")
+
+if not SUPABASE_SECRET_KEY:
+    raise RuntimeError("Falta SUPABASE_SECRET_KEY")
+
+
+HEADERS = {
+    "apikey": SUPABASE_SECRET_KEY,
+    "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+    "Content-Type": "application/json",
+}
+
+
+# ============================================================
+# SUPABASE
+# ============================================================
+
+def supabase_url(table: str) -> str:
+    return f"{SUPABASE_URL}/rest/v1/{table}"
+
+
+def supabase_get(table: str, params: dict):
+    with httpx.Client(timeout=60.0) as client:
+        response = client.get(
+            supabase_url(table),
+            headers=HEADERS,
+            params=params,
+        )
+
+    if response.status_code not in (200, 206):
+        raise RuntimeError(
+            f"Supabase GET {table} "
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+    data = response.json()
+
+    if not isinstance(data, list):
+        return []
+
+    return data
+
+
+def supabase_post(table: str, payload: dict):
+    headers = dict(HEADERS)
+    headers["Prefer"] = (
+        "resolution=merge-duplicates,"
+        "return=representation"
+    )
+
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(
+            supabase_url(table),
+            headers=headers,
+            json=payload,
+        )
+
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Supabase POST {table} "
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+    if not response.text:
+        return []
+
+    return response.json()
+
+
+def supabase_patch(
+    table: str,
+    params: dict,
+    payload: dict,
+):
+    headers = dict(HEADERS)
+    headers["Prefer"] = "return=representation"
+
+    with httpx.Client(timeout=60.0) as client:
+        response = client.patch(
+            supabase_url(table),
+            headers=headers,
+            params=params,
+            json=payload,
+        )
+
+    if response.status_code not in (200, 204):
+        raise RuntimeError(
+            f"Supabase PATCH {table} "
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+    if not response.text:
+        return []
+
+    return response.json()
+
+
+# ============================================================
+# CARGAR PARTIDOS TERMINADOS
+# ============================================================
+
+def load_matches():
+    print("=== CARGANDO PARTIDOS ===")
+
+    params = {
+        "select": (
+            "id,"
+            "starting_at,"
+            "status,"
+            "home_team_id,"
+            "away_team_id,"
+            "home_goals,"
+            "away_goals"
+        ),
+        "status": "in.(FT,AET,PEN)",
+        "order": "starting_at.asc",
+        "limit": "1000",
+    }
+
+    rows = supabase_get("matches", params)
+
+    print(f"Partidos recibidos: {len(rows)}")
+
+    return rows
+
+
+# ============================================================
+# LIMPIAR PARTIDOS
+# ============================================================
+
+def clean_matches(rows):
+    cleaned = []
+
+    for row in rows:
+        try:
+            if row.get("home_team_id") is None:
+                continue
+
+            if row.get("away_team_id") is None:
+                continue
+
+            if row.get("home_goals") is None:
+                continue
+
+            if row.get("away_goals") is None:
+                continue
+
+            if row.get("starting_at") is None:
+                continue
+
+            home_goals = int(row["home_goals"])
+            away_goals = int(row["away_goals"])
+
+            if home_goals < 0 or away_goals < 0:
+                continue
+
+            cleaned.append(
+                {
+                    "id": int(row["id"]),
+                    "starting_at": row["starting_at"],
+                    "home_team_id": int(row["home_team_id"]),
+                    "away_team_id": int(row["away_team_id"]),
+                    "home_goals": home_goals,
+                    "away_goals": away_goals,
+                }
+            )
+
+        except Exception:
+            continue
+
+    cleaned.sort(key=lambda item: item["starting_at"])
+
+    return cleaned
+
+
+# ============================================================
+# FORMA RECIENTE DE UN EQUIPO
+# ============================================================
+
+def team_form(history):
+    if len(history) < WINDOW:
+        return None
+
+    # deque no permite slicing directo.
+    # Lo convertimos a lista antes de tomar los ultimos partidos.
+    recent = list(history)[-WINDOW:]
+
+    goals_for = sum(
+        item["gf"]
+        for item in recent
+    )
+
+    goals_against = sum(
+        item["ga"]
+        for item in recent
+    )
+
+    points = sum(
+        item["points"]
+        for item in recent
+    )
+
+    return {
+        "goals_for": goals_for / WINDOW,
+        "goals_against": goals_against / WINDOW,
+        "points": points / WINDOW,
+    }
+
+
+# ============================================================
+# CONSTRUIR DATASET SIN FUGA DE INFORMACION
+# ============================================================
+
+def build_dataset(matches):
+    histories = defaultdict(
+        lambda: deque(maxlen=WINDOW)
+    )
+
+    X = []
+    y = []
+    match_ids = []
+
+    skipped = 0
+
+    for match in matches:
+        home_id = match["home_team_id"]
+        away_id = match["away_team_id"]
+
+        # ----------------------------------------------------
+        # OBTENER FORMA ANTERIOR AL PARTIDO
+        # ----------------------------------------------------
+
+        home_form = team_form(
+            histories[home_id]
+        )
+
+        away_form = team_form(
+            histories[away_id]
+        )
+
+        home_goals = match["home_goals"]
+        away_goals = match["away_goals"]
+
+        # ----------------------------------------------------
+        # SI NO HAY 5 PARTIDOS PREVIOS,
+        # NO USAMOS ESTE PARTIDO PARA ENTRENAMIENTO.
+        # PERO SIEMPRE ACTUALIZAMOS EL HISTORIAL DESPUES.
+        # ----------------------------------------------------
+
+        if (
+            home_form is None
+            or away_form is None
+        ):
+            skipped += 1
+
+            if home_goals > away_goals:
+                home_points = 3
+                away_points = 0
+
+            elif home_goals == away_goals:
+                home_points = 1
+                away_points = 1
+
+            else:
+                home_points = 0
+                away_points = 3
+
+            histories[home_id].append(
+                {
+                    "gf": home_goals,
+                    "ga": away_goals,
+                    "points": home_points,
+                }
+            )
+
+            histories[away_id].append(
+                {
+                    "gf": away_goals,
+                    "ga": home_goals,
+                    "points": away_points,
+                }
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # CREAR VARIABLES USANDO SOLO DATOS ANTERIORES
+        # ----------------------------------------------------
+
+        feature_vector = [
+            home_form["goals_for"],
+            home_form["goals_against"],
+            home_form["points"],
+            away_form["goals_for"],
+            away_form["goals_against"],
+            away_form["points"],
+            (
+                home_form["goals_for"]
+                - home_form["goals_against"]
+            )
+            - (
+                away_form["goals_for"]
+                - away_form["goals_against"]
+            ),
+            (
+                home_form["points"]
+                - away_form["points"]
+            ),
+            1.0,
+        ]
+
+        # ----------------------------------------------------
+        # OBJETIVO 1X2
+        #
+        # 0 = LOCAL
+        # 1 = EMPATE
+        # 2 = VISITANTE
+        # ----------------------------------------------------
+
+        if home_goals > away_goals:
+            target = 0
+
+        elif home_goals == away_goals:
+            target = 1
+
+        else:
+            target = 2
+
+        X.append(feature_vector)
+        y.append(target)
+        match_ids.append(match["id"])
+
+        # ----------------------------------------------------
+        # SOLO AHORA AGREGAMOS EL RESULTADO AL HISTORIAL
+        # ----------------------------------------------------
+
+        if home_goals > away_goals:
+            home_points = 3
+            away_points = 0
+
+        elif home_goals == away_goals:
+            home_points = 1
+            away_points = 1
+
+        else:
+            home_points = 0
+            away_points = 3
+
+        histories[home_id].append(
+            {
+                "gf": home_goals,
+                "ga": away_goals,
+                "points": home_points,
+            }
+        )
+
+        histories[away_id].append(
+            {
+                "gf": away_goals,
+                "ga": home_goals,
+                "points": away_points,
+            }
+        )
+
+    print(f"Ejemplos utilizables: {len(X)}")
+    print(
+        "Partidos descartados por falta "
+        f"de historial: {skipped}"
+    )
+
+    return (
+        np.array(X, dtype=float),
+        np.array(y, dtype=int),
+        match_ids,
+    )
+
+
+# ============================================================
+# ENTRENAMIENTO
+# ============================================================
+
+def train_model(X, y):
+    if len(X) < 30:
+        raise RuntimeError(
+            "No hay suficientes partidos "
+            "para entrenar el modelo."
+        )
+
+    unique_classes = sorted(
+        set(int(value) for value in y.tolist())
+    )
+
+    if unique_classes != [0, 1, 2]:
+        raise RuntimeError(
+            "El dataset no contiene correctamente "
+            "las tres clases 0=Local, 1=Empate, "
+            "2=Visitante."
+        )
+
+    # --------------------------------------------------------
+    # DIVISION TEMPORAL
+    # 80% entrenamiento
+    # 20% validacion
+    # --------------------------------------------------------
+
+    split = int(len(X) * 0.80)
+
+    if split < 20:
+        raise RuntimeError(
+            "El conjunto de entrenamiento "
+            "es demasiado pequeño."
+        )
+
+    X_train = X[:split]
+    y_train = y[:split]
+
+    X_valid = X[split:]
+    y_valid = y[split:]
+
+    if len(X_valid) < 5:
+        raise RuntimeError(
+            "El conjunto de validacion "
+            "es demasiado pequeño."
+        )
+
+    scaler = StandardScaler()
+
+    X_train_scaled = scaler.fit_transform(
+        X_train
+    )
+
+    X_valid_scaled = scaler.transform(
+        X_valid
+    )
+
+    model = LogisticRegression(
+        solver="lbfgs",
+        max_iter=2000,
+        C=1.0,
+        random_state=42,
+    )
+
+    model.fit(
+        X_train_scaled,
+        y_train,
+    )
+
+    valid_probabilities = (
+        model.predict_proba(
+            X_valid_scaled
+        )
+    )
+
+    valid_predictions = model.predict(
+        X_valid_scaled
+    )
+
+    accuracy = accuracy_score(
+        y_valid,
+        valid_predictions,
+    )
+
+    logloss = log_loss(
+        y_valid,
+        valid_probabilities,
+        labels=model.classes_,
+    )
+
+    print("")
+    print("=== VALIDACION DEL MODELO ===")
+    print(f"Entrenamiento: {len(X_train)}")
+    print(f"Validacion: {len(X_valid)}")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Log loss: {logloss:.4f}")
+
+    return (
+        model,
+        scaler,
+        accuracy,
+        logloss,
+        len(X_train),
+        len(X_valid),
+    )
+
+
+# ============================================================
+# SERIALIZAR MODELO
+# ============================================================
+
+def serialize_model(
+    model,
+    scaler,
+    accuracy,
+    logloss,
+    training_matches,
+    validation_matches,
+):
+    model_blob = {
+        "model_type": "logistic_regression",
+
+        "features": FEATURE_NAMES,
+
+        "classes": [
+            int(item)
+            for item in model.classes_
+        ],
+
+        "coefficients": [
+            [
+                float(value)
+                for value in row
+            ]
+            for row in model.coef_
+        ],
+
+        "intercept": [
+            float(value)
+            for value in model.intercept_
+        ],
+
+        "scaler_mean": [
+            float(value)
+            for value in scaler.mean_
+        ],
+
+        "scaler_scale": [
+            float(value)
+            for value in scaler.scale_
+        ],
+
+        "validation_accuracy": float(
+            accuracy
+        ),
+
+        "validation_log_loss": float(
+            logloss
+        ),
+
+        "training_matches": int(
+            training_matches
+        ),
+
+        "validation_matches": int(
+            validation_matches
+        ),
+    }
+
+    return model_blob
+
+
+# ============================================================
+# OBTENER MODELO ACTIVO
+# ============================================================
+
+def get_active_model():
+    rows = supabase_get(
+        "model_versions",
+        {
+            "select": (
+                "version,"
+                "model_name,"
+                "trained_at,"
+                "training_matches,"
+                "metrics,"
+                "active"
+            ),
+            "active": "eq.true",
+            "order": "trained_at.desc",
+            "limit": "1",
+        },
+    )
+
+    if not rows:
+        return None
+
+    return rows[0]
+
+
+# ============================================================
+# OBTENER LOG LOSS DEL MODELO ACTIVO
+# ============================================================
+
+def active_log_loss(active):
+    if not active:
+        return None
+
+    metrics = active.get("metrics")
+
+    if not isinstance(metrics, dict):
+        return None
+
+    value = metrics.get(
+        "validation_log_loss"
+    )
+
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+# ============================================================
+# GUARDAR MODELO
+# ============================================================
+
+def save_model(
+    model_blob,
+    accuracy,
+    logloss,
+    training_matches,
+    validation_matches,
+):
+    now = datetime.now(timezone.utc)
+
+    version = (
+        "1X2-"
+        + now.strftime(
+            "%Y%m%d-%H%M%S"
+        )
+    )
+
+    active = get_active_model()
+
+    previous_logloss = active_log_loss(
+        active
+    )
+
+    # Primer modelo:
+    # se activa automaticamente.
+    #
+    # Modelos futuros:
+    # solo reemplazan al activo si tienen
+    # igual o menor log loss.
+
+    if previous_logloss is None:
+        should_activate = True
+    else:
+        should_activate = (
+            logloss <= previous_logloss
+        )
+
+    if should_activate:
+        supabase_patch(
+            "model_versions",
+            {
+                "active": "eq.true"
+            },
+            {
+                "active": False
+            },
+        )
+
+    row = {
+        "version": version,
+
+        "model_name": (
+            "FutbolIA-1X2-"
+            "LogisticRegression"
+        ),
+
+        "trained_at": now.isoformat(),
+
+        "training_matches": int(
+            training_matches
+        ),
+
+        "metrics": {
+            **model_blob,
+
+            "previous_active_log_loss": (
+                previous_logloss
+            ),
+        },
+
+        "active": should_activate,
+    }
+
+    supabase_post(
+        "model_versions",
+        row,
+    )
+
+    print("")
+    print("=== MODELO GUARDADO ===")
+    print(f"Version: {version}")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Log loss: {logloss:.4f}")
+    print(
+        "Modelo anterior: "
+        f"{previous_logloss}"
+    )
+    print(
+        "Activado: "
+        f"{should_activate}"
+    )
+
+    return {
+        "version": version,
+        "active": should_activate,
+        "accuracy": accuracy,
+        "log_loss": logloss,
+        "previous_log_loss": previous_logloss,
+        "training_matches": training_matches,
+        "validation_matches": validation_matches,
+    }
+
+
+# ============================================================
+# PROGRAMA PRINCIPAL
+# ============================================================
+
+def main():
+    print("")
+    print("========================================")
+    print("FUTBOL IA - ENTRENAMIENTO REAL")
+    print("========================================")
+    print("")
+
+    # CARGAR DATOS
+
+    matches_raw = load_matches()
+
+    matches = clean_matches(
+        matches_raw
+    )
+
+    print(
+        f"Partidos validos: {len(matches)}"
+    )
+
+    if len(matches) < 50:
+        raise RuntimeError(
+            "Se necesitan al menos "
+            "50 partidos validos."
+        )
+
+    # CONSTRUIR DATASET
+
+    X, y, match_ids = build_dataset(
+        matches
+    )
+
+    print(
+        f"Dataset final: {len(X)} ejemplos"
+    )
+
+    if len(X) < 30:
+        raise RuntimeError(
+            "No quedaron suficientes "
+            "ejemplos utilizables despues "
+            "de construir el historial."
+        )
+
+    # ENTRENAR
+
+    (
+        model,
+        scaler,
+        accuracy,
+        logloss,
+        training_matches,
+        validation_matches,
+    ) = train_model(
+        X,
+        y,
+    )
+
+    # SERIALIZAR
+
+    model_blob = serialize_model(
+        model,
+        scaler,
+        accuracy,
+        logloss,
+        training_matches,
+        validation_matches,
+    )
+
+    # GUARDAR EN SUPABASE
+
+    result = save_model(
+        model_blob,
+        accuracy,
+        logloss,
+        training_matches,
+        validation_matches,
+    )
+
+    print("")
+    print("========================================")
+    print("ENTRENAMIENTO FINALIZADO")
+    print("========================================")
+    print(
+        json.dumps(
+            result,
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    print("========================================")
+
+
+if __name__ == "__main__":
+    main()
