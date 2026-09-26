@@ -1,0 +1,37 @@
+name: Cargar historial y reentrenar IA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync-and-train:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Descargar proyecto
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+
+      - name: Cargar historial de equipos próximos
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          python app/sync_team_history.py
+
+      - name: Entrenar nueva versión de Fútbol IA
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          python app/train_ai.py
