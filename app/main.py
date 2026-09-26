@@ -6,12 +6,15 @@ import httpx
 from fastapi import FastAPI, HTTPException
 
 from app.ai_predict import predict_match, load_active_model
+from app.ai_evaluate import router as ai_evaluate_router
 
 
 app = FastAPI(
     title="Fútbol IA 2.0 API",
-    version="0.7.0"
+    version="0.7.1"
 )
+
+app.include_router(ai_evaluate_router)
 
 BASE_URL = "https://v3.football.api-sports.io"
 
@@ -265,7 +268,7 @@ async def root():
     return {
         "ok": True,
         "app": "Fútbol IA 2.0",
-        "version": "0.7.0",
+        "version": "0.7.1",
         "message": "Backend funcionando"
     }
 
@@ -277,7 +280,7 @@ async def health():
         "ok": True,
         "status": "healthy",
         "app": "Fútbol IA 2.0",
-        "version": "0.7.0",
+        "version": "0.7.1",
         "time": utc_now()
     }
 
@@ -711,13 +714,6 @@ async def sync_fixtures(
     saved = 0
     skipped = 0
 
-    # IMPORTANTE:
-    # El árbitro es opcional.
-    # No insertamos árbitros aquí porque
-    # la tabla referees requiere un ID.
-    #
-    # El partido se guarda con referee_id = null.
-
     for item in response:
 
         fixture_info = item.get(
@@ -797,55 +793,29 @@ async def sync_fixtures(
 
         payload = {
             "id": fixture_id,
-
             "league_id": league,
-
             "season_id": season_id,
-
-            "home_team_id": (
-                home_team_id
-            ),
-
-            "away_team_id": (
-                away_team_id
-            ),
-
+            "home_team_id": home_team_id,
+            "away_team_id": away_team_id,
             "referee_id": None,
-
-            "starting_at": (
-                fixture_info.get(
-                    "date"
-                )
+            "starting_at": fixture_info.get(
+                "date"
             ),
-
             "status": status_info.get(
                 "short"
             ),
-
-            "home_goals": (
-                goals_info.get(
-                    "home"
-                )
+            "home_goals": goals_info.get(
+                "home"
             ),
-
-            "away_goals": (
-                goals_info.get(
-                    "away"
-                )
+            "away_goals": goals_info.get(
+                "away"
             ),
-
-            "home_ht_goals": (
-                halftime.get(
-                    "home"
-                )
+            "home_ht_goals": halftime.get(
+                "home"
             ),
-
-            "away_ht_goals": (
-                halftime.get(
-                    "away"
-                )
+            "away_ht_goals": halftime.get(
+                "away"
             ),
-
             "updated_at": utc_now()
         }
 
@@ -973,15 +943,9 @@ async def sync_statistics(
 
             payload = {
                 "match_id": fixture,
-
                 "team_id": team_id,
-
                 "stat_type": stat_type,
-
-                "value_numeric": (
-                    numeric_value
-                ),
-
+                "value_numeric": numeric_value,
                 "value_text": text_value
             }
 
@@ -1165,9 +1129,7 @@ async def sync_statistics_batch(
             failed.append({
                 "fixture": fixture_id,
                 "status": "error",
-                "http_status": (
-                    exc.status_code
-                ),
+                "http_status": exc.status_code,
                 "detail": exc.detail
             })
 
@@ -1227,35 +1189,24 @@ async def ai_status():
 
         return {
             "ok": True,
-
             "active": True,
-
             "model_version": model.get(
                 "version"
             ),
-
             "model_name": model.get(
                 "model_name"
             ),
-
             "trained_at": model.get(
                 "trained_at"
             ),
-
             "training_matches": model.get(
                 "training_matches"
             ),
-
-            "validation_accuracy": (
-                metrics.get(
-                    "validation_accuracy"
-                )
+            "validation_accuracy": metrics.get(
+                "validation_accuracy"
             ),
-
-            "validation_log_loss": (
-                metrics.get(
-                    "validation_log_loss"
-                )
+            "validation_log_loss": metrics.get(
+                "validation_log_loss"
             )
         }
 
