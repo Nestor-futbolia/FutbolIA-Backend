@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 import httpx
@@ -11,7 +11,7 @@ from app.ai_evaluate import router as ai_evaluate_router
 
 app = FastAPI(
     title="Fútbol IA 2.0 API",
-    version="0.8.0"
+    version="0.8.1"
 )
 
 app.include_router(ai_evaluate_router)
@@ -36,6 +36,7 @@ def get_api_football_key() -> str:
 
 
 def get_supabase_config() -> tuple[str, str]:
+
     url = os.getenv(
         "SUPABASE_URL",
         ""
@@ -241,9 +242,43 @@ async def supabase_upsert(
 # ============================================================
 
 def utc_now() -> str:
+
     return datetime.now(
         timezone.utc
     ).isoformat()
+
+
+def parse_api_date(
+    value: Optional[str]
+) -> Optional[datetime]:
+
+    if not value:
+        return None
+
+    try:
+
+        normalized = value.replace(
+            "Z",
+            "+00:00"
+        )
+
+        dt = datetime.fromisoformat(
+            normalized
+        )
+
+        if dt.tzinfo is None:
+
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        return dt.astimezone(
+            timezone.utc
+        )
+
+    except Exception:
+
+        return None
 
 
 def safe_int(
@@ -300,7 +335,7 @@ async def root():
     return {
         "ok": True,
         "app": "Fútbol IA 2.0",
-        "version": "0.8.0",
+        "version": "0.8.1",
         "message": "Backend funcionando"
     }
 
@@ -312,13 +347,13 @@ async def health():
         "ok": True,
         "status": "healthy",
         "app": "Fútbol IA 2.0",
-        "version": "0.8.0",
+        "version": "0.8.1",
         "time": utc_now()
     }
 
 
 # ============================================================
-# API-FOOTBALL — PAÍSES
+# PAÍSES
 # ============================================================
 
 @app.get("/countries")
@@ -330,7 +365,7 @@ async def countries():
 
 
 # ============================================================
-# API-FOOTBALL — LIGAS
+# LIGAS
 # ============================================================
 
 @app.get("/leagues")
@@ -354,7 +389,7 @@ async def leagues(
 
 
 # ============================================================
-# API-FOOTBALL — FIXTURES
+# FIXTURES
 # ============================================================
 
 @app.get("/fixtures")
@@ -740,7 +775,7 @@ async def sync_teams(
 
 
 # ============================================================
-# SINCRONIZAR FIXTURES DE UNA TEMPORADA
+# SINCRONIZAR FIXTURES DE TEMPORADA
 # ============================================================
 
 @app.get("/sync/fixtures")
@@ -908,6 +943,16 @@ async def sync_fixtures(
 
 # ============================================================
 # NUEVO — SINCRONIZAR PRÓXIMOS PARTIDOS
+#
+# IMPORTANTE:
+# NO usamos ?next= porque el plan gratuito
+# de API-Football lo rechaza.
+#
+# Usamos:
+#   date=HOY
+#   date=MAÑANA
+#
+# Son solamente 2 llamadas.
 # ============================================================
 
 @app.get("/sync/upcoming")
@@ -925,35 +970,108 @@ async def sync_upcoming(
             )
         )
 
-    data = await football_get(
-        "/fixtures",
-        {
-            "next": limit
-        }
+    now_utc = datetime.now(
+        timezone.utc
     )
 
-    response = data.get(
-        "response",
-        []
-    )
+    today = now_utc.date()
 
-    if not response:
+    dates = [
+        today,
+        today + timedelta(days=1)
+    ]
 
-        return {
-            "ok": True,
-            "selected": 0,
-            "saved": 0,
-            "skipped": 0,
-            "message": (
-                "API-Football no devolvió "
-                "próximos partidos"
+    all_future_fixtures = []
+
+    for target_date in dates:
+
+        date_string = target_date.isoformat()
+
+        data = await football_get(
+            "/fixtures",
+            {
+                "date": date_string
+            }
+        )
+
+        response = data.get(
+            "response",
+            []
+        )
+
+        for item in response:
+
+            fixture_info = item.get(
+                "fixture",
+                {}
             )
-        }
+
+            fixture_date = parse_api_date(
+                fixture_info.get(
+                    "date"
+                )
+            )
+
+            if (
+                fixture_date is not None
+                and fixture_date >= now_utc
+            ):
+
+                all_future_fixtures.append(
+                    item
+                )
+
+    # Ordenar por hora de inicio
+    all_future_fixtures.sort(
+        key=lambda item: (
+            parse_api_date(
+                item.get(
+                    "fixture",
+                    {}
+                ).get(
+                    "date"
+                )
+            )
+            or datetime.max.replace(
+                tzinfo=timezone.utc
+            )
+        )
+    )
+
+    # Evitar duplicados
+    unique_fixtures = []
+    seen_ids = set()
+
+    for item in all_future_fixtures:
+
+        fixture_id = item.get(
+            "fixture",
+            {}
+        ).get(
+            "id"
+        )
+
+        if fixture_id is None:
+            continue
+
+        if fixture_id in seen_ids:
+            continue
+
+        seen_ids.add(
+            fixture_id
+        )
+
+        unique_fixtures.append(
+            item
+        )
+
+        if len(unique_fixtures) >= limit:
+            break
 
     saved = 0
     skipped = 0
 
-    for item in response:
+    for item in unique_fixtures:
 
         fixture_info = item.get(
             "fixture",
@@ -967,16 +1085,6 @@ async def sync_upcoming(
 
         teams_info = item.get(
             "teams",
-            {}
-        )
-
-        goals_info = item.get(
-            "goals",
-            {}
-        )
-
-        score_info = item.get(
-            "score",
             {}
         )
 
@@ -994,6 +1102,10 @@ async def sync_upcoming(
 
         country_name = league_info.get(
             "country"
+        )
+
+        league_type = league_info.get(
+            "type"
         )
 
         season_year = league_info.get(
@@ -1030,16 +1142,14 @@ async def sync_upcoming(
             continue
 
         # ----------------------------------------------------
-        # Guardar liga
+        # LIGA
         # ----------------------------------------------------
 
         league_payload = {
             "id": league_id,
             "name": league_name,
             "country": country_name,
-            "type": league_info.get(
-                "type"
-            ),
+            "type": league_type,
             "active": True
         }
 
@@ -1050,7 +1160,7 @@ async def sync_upcoming(
         )
 
         # ----------------------------------------------------
-        # Guardar temporada
+        # TEMPORADA
         # ----------------------------------------------------
 
         season_id = (
@@ -1073,7 +1183,7 @@ async def sync_upcoming(
         )
 
         # ----------------------------------------------------
-        # Guardar equipo local
+        # EQUIPO LOCAL
         # ----------------------------------------------------
 
         home_payload = {
@@ -1098,7 +1208,7 @@ async def sync_upcoming(
         )
 
         # ----------------------------------------------------
-        # Guardar equipo visitante
+        # EQUIPO VISITANTE
         # ----------------------------------------------------
 
         away_payload = {
@@ -1123,16 +1233,11 @@ async def sync_upcoming(
         )
 
         # ----------------------------------------------------
-        # Guardar partido
+        # PARTIDO
         # ----------------------------------------------------
 
         status_info = fixture_info.get(
             "status",
-            {}
-        )
-
-        halftime = score_info.get(
-            "halftime",
             {}
         )
 
@@ -1149,18 +1254,10 @@ async def sync_upcoming(
             "status": status_info.get(
                 "short"
             ),
-            "home_goals": goals_info.get(
-                "home"
-            ),
-            "away_goals": goals_info.get(
-                "away"
-            ),
-            "home_ht_goals": halftime.get(
-                "home"
-            ),
-            "away_ht_goals": halftime.get(
-                "away"
-            ),
+            "home_goals": None,
+            "away_goals": None,
+            "home_ht_goals": None,
+            "away_ht_goals": None,
             "updated_at": utc_now()
         }
 
@@ -1174,11 +1271,20 @@ async def sync_upcoming(
 
     return {
         "ok": True,
-        "requested": limit,
-        "selected": len(response),
+        "current_time_utc": now_utc.isoformat(),
+        "dates_checked": [
+            date.isoformat()
+            for date in dates
+        ],
+        "requested_limit": limit,
+        "future_fixtures_found": len(
+            all_future_fixtures
+        ),
+        "selected": len(
+            unique_fixtures
+        ),
         "saved": saved,
-        "skipped": skipped,
-        "current_time_utc": utc_now()
+        "skipped": skipped
     }
 
 
@@ -1312,7 +1418,7 @@ async def sync_statistics(
 
 
 # ============================================================
-# FIXTURES CON ESTADÍSTICAS
+# OBTENER FIXTURES CON ESTADÍSTICAS
 # ============================================================
 
 async def get_saved_statistic_fixture_ids() -> set[int]:
