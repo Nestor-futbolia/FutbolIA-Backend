@@ -1,0 +1,52 @@
+name: Verificar estadisticas en Supabase
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verificar datos en Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          echo "========================================"
+          echo "VERIFICANDO ESTADISTICAS EN SUPABASE"
+          echo "========================================"
+
+          HTTP_CODE=$(curl -s \
+            -o response.json \
+            -D headers.txt \
+            -w "%{http_code}" \
+            -H "apikey: $SUPABASE_SECRET_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SECRET_KEY" \
+            -H "Prefer: count=exact" \
+            "$SUPABASE_URL/rest/v1/match_statistics?select=id,match_id,team_id,stat_type,value_numeric&limit=10")
+
+          echo ""
+          echo "=== CODIGO HTTP ==="
+          echo "$HTTP_CODE"
+
+          echo ""
+          echo "=== DATOS ==="
+          cat response.json
+
+          echo ""
+          echo "=== CABECERAS ==="
+          grep -i "content-range" headers.txt || true
+
+          echo ""
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "========================================"
+            echo "SUPABASE RESPONDE CORRECTAMENTE"
+            echo "========================================"
+          else
+            echo "========================================"
+            echo "ERROR CONSULTANDO SUPABASE"
+            echo "========================================"
+            exit 1
+          fi
