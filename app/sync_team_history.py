@@ -8,17 +8,15 @@ import httpx
 
 BASE_URL = "https://v3.football.api-sports.io"
 
-# ============================================================
-# CONFIGURACIÓN
-# ============================================================
+# El plan Free de API-Football permite trabajar con temporadas
+# históricas disponibles. Usamos 2024 explícitamente.
+HISTORICAL_SEASON = 2024
 
 UPCOMING_MATCH_LIMIT = 10
 LAST_MATCHES_PER_TEAM = 10
 
-# API-Football Free permite 10 solicitudes/minuto.
-# 7 segundos entre llamadas deja margen de seguridad.
+# Límite Free: 10 solicitudes/minuto.
 SECONDS_BETWEEN_API_CALLS = 7
-
 
 API_FOOTBALL_KEY = os.getenv(
     "API_FOOTBALL_KEY",
@@ -37,43 +35,29 @@ SUPABASE_SECRET_KEY = os.getenv(
 
 
 if not API_FOOTBALL_KEY:
-    raise RuntimeError(
-        "Falta API_FOOTBALL_KEY"
-    )
+    raise RuntimeError("Falta API_FOOTBALL_KEY")
 
 if not SUPABASE_URL:
-    raise RuntimeError(
-        "Falta SUPABASE_URL"
-    )
+    raise RuntimeError("Falta SUPABASE_URL")
 
 if not SUPABASE_SECRET_KEY:
-    raise RuntimeError(
-        "Falta SUPABASE_SECRET_KEY"
-    )
+    raise RuntimeError("Falta SUPABASE_SECRET_KEY")
 
 
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_SECRET_KEY,
-    "Authorization": (
-        f"Bearer {SUPABASE_SECRET_KEY}"
-    ),
+    "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
     "Content-Type": "application/json",
 }
 
 
-# ============================================================
-# SUPABASE
-# ============================================================
-
 def supabase_url(table: str) -> str:
-    return (
-        f"{SUPABASE_URL}/rest/v1/{table}"
-    )
+    return f"{SUPABASE_URL}/rest/v1/{table}"
 
 
 def supabase_get(
     table: str,
-    params: dict[str, Any]
+    params: dict[str, Any],
 ):
     with httpx.Client(timeout=60.0) as client:
         response = client.get(
@@ -98,11 +82,9 @@ def supabase_get(
 def supabase_upsert(
     table: str,
     payload: dict[str, Any],
-    on_conflict: str
+    on_conflict: str,
 ):
-    headers = dict(
-        SUPABASE_HEADERS
-    )
+    headers = dict(SUPABASE_HEADERS)
 
     headers["Prefer"] = (
         "resolution=merge-duplicates,"
@@ -132,13 +114,9 @@ def supabase_upsert(
     return response.json()
 
 
-# ============================================================
-# API-FOOTBALL
-# ============================================================
-
 def football_get(
     endpoint: str,
-    params: dict[str, Any]
+    params: dict[str, Any],
 ):
     url = (
         endpoint
@@ -150,15 +128,14 @@ def football_get(
         response = client.get(
             url,
             headers={
-                "x-apisports-key":
-                    API_FOOTBALL_KEY
+                "x-apisports-key": API_FOOTBALL_KEY
             },
             params=params,
         )
 
     if response.status_code >= 400:
         raise RuntimeError(
-            "API-Football HTTP "
+            f"API-Football HTTP "
             f"{response.status_code}: "
             f"{response.text}"
         )
@@ -169,16 +146,11 @@ def football_get(
 
     if errors:
         raise RuntimeError(
-            "API-Football errors: "
-            f"{errors}"
+            f"API-Football errors: {errors}"
         )
 
     return data
 
-
-# ============================================================
-# UTILIDADES
-# ============================================================
 
 def utc_now() -> str:
     return datetime.now(
@@ -188,7 +160,7 @@ def utc_now() -> str:
 
 def safe_int(
     value,
-    default=None
+    default=None,
 ):
     try:
         if value is None:
@@ -201,7 +173,7 @@ def safe_int(
 
 
 def finished_status(
-    status: str
+    status: str,
 ) -> bool:
     return status in {
         "FT",
@@ -210,16 +182,12 @@ def finished_status(
     }
 
 
-# ============================================================
-# PRÓXIMOS PARTIDOS
-# ============================================================
-
 def load_upcoming_matches():
     now = datetime.now(
         timezone.utc
     ).isoformat()
 
-    rows = supabase_get(
+    return supabase_get(
         "matches",
         {
             "select": (
@@ -229,9 +197,7 @@ def load_upcoming_matches():
                 "home_team_id,"
                 "away_team_id"
             ),
-            "starting_at": (
-                f"gt.{now}"
-            ),
+            "starting_at": f"gt.{now}",
             "order": "starting_at.asc",
             "limit": str(
                 UPCOMING_MATCH_LIMIT
@@ -239,15 +205,9 @@ def load_upcoming_matches():
         },
     )
 
-    return rows
-
-
-# ============================================================
-# GUARDAR FIXTURE
-# ============================================================
 
 def save_fixture(
-    item: dict
+    item: dict,
 ):
     fixture_info = item.get(
         "fixture",
@@ -313,10 +273,6 @@ def save_fixture(
     ):
         return False
 
-    # --------------------------------------------------------
-    # LIGA
-    # --------------------------------------------------------
-
     supabase_upsert(
         "leagues",
         {
@@ -335,10 +291,6 @@ def save_fixture(
         "id",
     )
 
-    # --------------------------------------------------------
-    # TEMPORADA
-    # --------------------------------------------------------
-
     season_id = (
         league_id * 10000
         + season_year
@@ -356,46 +308,26 @@ def save_fixture(
         "id",
     )
 
-    # --------------------------------------------------------
-    # EQUIPO LOCAL
-    # --------------------------------------------------------
-
     supabase_upsert(
         "teams",
         {
             "id": home_team_id,
-            "name": home.get(
-                "name"
-            ),
-            "short_code": home.get(
-                "code"
-            ),
-            "country": home.get(
-                "country"
-            ),
+            "name": home.get("name"),
+            "short_code": home.get("code"),
+            "country": home.get("country"),
             "venue_name": None,
             "league_id": league_id,
         },
         "id",
     )
 
-    # --------------------------------------------------------
-    # EQUIPO VISITANTE
-    # --------------------------------------------------------
-
     supabase_upsert(
         "teams",
         {
             "id": away_team_id,
-            "name": away.get(
-                "name"
-            ),
-            "short_code": away.get(
-                "code"
-            ),
-            "country": away.get(
-                "country"
-            ),
+            "name": away.get("name"),
+            "short_code": away.get("code"),
+            "country": away.get("country"),
             "venue_name": None,
             "league_id": league_id,
         },
@@ -411,10 +343,6 @@ def save_fixture(
         "halftime",
         {}
     )
-
-    # --------------------------------------------------------
-    # PARTIDO
-    # --------------------------------------------------------
 
     supabase_upsert(
         "matches",
@@ -451,26 +379,25 @@ def save_fixture(
     return True
 
 
-# ============================================================
-# HISTORIAL DE UN EQUIPO
-# ============================================================
-
 def sync_team_history(
-    team_id: int
+    team_id: int,
 ):
     print("")
+    print("=" * 60)
     print(
-        "----------------------------------------"
+        f"EQUIPO {team_id}"
     )
     print(
-        f"Equipo {team_id}: "
-        f"últimos {LAST_MATCHES_PER_TEAM} partidos"
+        f"TEMPORADA HISTÓRICA: "
+        f"{HISTORICAL_SEASON}"
     )
+    print("=" * 60)
 
     data = football_get(
         "/fixtures",
         {
             "team": team_id,
+            "season": HISTORICAL_SEASON,
             "last": LAST_MATCHES_PER_TEAM,
         },
     )
@@ -480,10 +407,25 @@ def sync_team_history(
         []
     )
 
+    if not response:
+        print(
+            f"ADVERTENCIA: API-Football "
+            f"no devolvió partidos para "
+            f"el equipo {team_id}"
+        )
+
+        return {
+            "team_id": team_id,
+            "received": 0,
+            "finished": 0,
+            "saved": 0,
+        }
+
     saved = 0
     finished = 0
 
     for item in response:
+
         fixture_info = item.get(
             "fixture",
             {}
@@ -502,18 +444,19 @@ def sync_team_history(
 
         finished += 1
 
+        fixture_id = fixture_info.get(
+            "id"
+        )
+
         try:
-            if save_fixture(
-                item
-            ):
+            if save_fixture(item):
                 saved += 1
 
         except Exception as exc:
-            print(
-                "Error guardando fixture "
-                f"{fixture_info.get('id')}: "
-                f"{exc}"
-            )
+            raise RuntimeError(
+                f"Error guardando fixture "
+                f"{fixture_id}: {exc}"
+            ) from exc
 
     print(
         f"Partidos recibidos: "
@@ -521,11 +464,12 @@ def sync_team_history(
     )
 
     print(
-        f"Terminados: {finished}"
+        f"Partidos terminados: "
+        f"{finished}"
     )
 
     print(
-        f"Guardados/actualizados: "
+        f"Partidos guardados/actualizados: "
         f"{saved}"
     )
 
@@ -537,21 +481,11 @@ def sync_team_history(
     }
 
 
-# ============================================================
-# PRINCIPAL
-# ============================================================
-
 def main():
     print("")
-    print(
-        "========================================"
-    )
-    print(
-        "FUTBOL IA - CARGA DE HISTORIAL"
-    )
-    print(
-        "========================================"
-    )
+    print("=" * 60)
+    print("FÚTBOL IA - CARGA HISTÓRICA")
+    print("=" * 60)
 
     upcoming = (
         load_upcoming_matches()
@@ -563,11 +497,11 @@ def main():
     )
 
     if not upcoming:
-        print(
-            "No hay próximos partidos "
-            "guardados en Supabase."
+        raise RuntimeError(
+            "No hay partidos futuros en "
+            "Supabase. Ejecuta primero "
+            "/sync/upcoming."
         )
-        return
 
     team_ids = []
 
@@ -602,30 +536,29 @@ def main():
             )
 
     print(
-        f"Equipos únicos: "
+        f"Equipos únicos encontrados: "
         f"{len(team_ids)}"
     )
 
-    print(
-        f"Solicitudes máximas a "
-        f"API-Football: {len(team_ids)}"
-    )
+    if not team_ids:
+        raise RuntimeError(
+            "No se encontraron IDs de "
+            "equipos en los próximos partidos."
+        )
 
     results = []
+    errors = []
 
     for index, team_id in enumerate(
         team_ids
     ):
 
         if index > 0:
+            print("")
             print(
-                ""
-            )
-            print(
-                f"Esperando "
+                "Esperando "
                 f"{SECONDS_BETWEEN_API_CALLS} "
-                "segundos para respetar "
-                "el límite de API-Football..."
+                "segundos..."
             )
 
             time.sleep(
@@ -633,6 +566,7 @@ def main():
             )
 
         try:
+
             result = (
                 sync_team_history(
                     team_id
@@ -645,25 +579,29 @@ def main():
 
         except Exception as exc:
 
-            print(
-                f"ERROR equipo {team_id}: "
+            error_message = (
+                f"Equipo {team_id}: "
                 f"{exc}"
             )
 
-            results.append({
-                "team_id": team_id,
-                "error": str(exc),
-            })
+            print("")
+            print(
+                "ERROR:"
+            )
+            print(
+                error_message
+            )
 
-    print("")
-    print(
-        "========================================"
-    )
-    print(
-        "HISTORIAL FINALIZADO"
-    )
-    print(
-        "========================================"
+            errors.append(
+                error_message
+            )
+
+    total_finished = sum(
+        item.get(
+            "finished",
+            0
+        )
+        for item in results
     )
 
     total_saved = sum(
@@ -674,13 +612,10 @@ def main():
         for item in results
     )
 
-    total_finished = sum(
-        item.get(
-            "finished",
-            0
-        )
-        for item in results
-    )
+    print("")
+    print("=" * 60)
+    print("RESUMEN")
+    print("=" * 60)
 
     print(
         f"Equipos procesados: "
@@ -688,7 +623,12 @@ def main():
     )
 
     print(
-        f"Partidos terminados encontrados: "
+        f"Equipos con error: "
+        f"{len(errors)}"
+    )
+
+    print(
+        f"Partidos históricos encontrados: "
         f"{total_finished}"
     )
 
@@ -697,8 +637,35 @@ def main():
         f"{total_saved}"
     )
 
+    if errors:
+        print("")
+        print(
+            "ERRORES DETECTADOS:"
+        )
+
+        for error in errors:
+            print(
+                f"- {error}"
+            )
+
+        raise RuntimeError(
+            f"La carga histórica terminó "
+            f"con {len(errors)} errores."
+        )
+
+    if total_finished == 0:
+        raise RuntimeError(
+            "No se encontró ningún partido "
+            "histórico terminado. "
+            "No se ejecutará un entrenamiento "
+            "aparentemente exitoso con "
+            "datos inexistentes."
+        )
+
+    print("")
     print(
-        "========================================"
+        "Carga histórica completada "
+        "correctamente."
     )
 
 
