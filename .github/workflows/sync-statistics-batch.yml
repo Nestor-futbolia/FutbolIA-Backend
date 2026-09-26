@@ -1,4 +1,4 @@
-name: Sincronizar estadisticas por lote
+name: Sincronizar estadisticas historicas
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Descargar código
+      - name: Descargar codigo
         uses: actions/checkout@v4
 
       - name: Configurar Python
@@ -25,7 +25,9 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
         run: |
-          echo "=== INICIANDO BACKEND ==="
+          echo "========================================"
+          echo "INICIANDO BACKEND"
+          echo "========================================"
 
           python -m uvicorn app.main:app \
             --host 127.0.0.1 \
@@ -35,6 +37,7 @@ jobs:
 
           sleep 5
 
+          echo ""
           echo "=== LOG DEL BACKEND ==="
           cat server.log
 
@@ -44,41 +47,81 @@ jobs:
           curl -f http://127.0.0.1:8000/health
 
           echo ""
-          echo "=== SINCRONIZANDO LOTE ==="
+          echo "========================================"
+          echo "INICIANDO SINCRONIZACION HISTORICA"
           echo "Liga: 140"
           echo "Temporada: 2024"
-          echo "Límite: 5 partidos"
+          echo "Lotes: 8"
+          echo "Partidos por lote: 10"
+          echo "Maximo teorico: 80 partidos"
+          echo "========================================"
 
-          HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" \
-            "http://127.0.0.1:8000/sync/statistics/batch?league=140&season=2024&limit=5")
+          TOTAL_PROCESSED=0
+          TOTAL_FAILED=0
+
+          for BATCH in 1 2 3 4 5 6 7 8
+          do
+
+            echo ""
+            echo "========================================"
+            echo "LOTE $BATCH DE 8"
+            echo "========================================"
+
+            HTTP_CODE=$(curl -s \
+              -o response.json \
+              -w "%{http_code}" \
+              "http://127.0.0.1:8000/sync/statistics/batch?league=140&season=2024&limit=10")
+
+            echo ""
+            echo "CODIGO HTTP: $HTTP_CODE"
+
+            echo ""
+            echo "RESPUESTA:"
+            cat response.json
+
+            echo ""
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo ""
+              echo "ERROR EN EL LOTE $BATCH"
+              echo "Se detiene la sincronizacion para proteger el limite de API."
+              cat response.json
+              kill $SERVER_PID || true
+              exit 1
+            fi
+
+            PROCESSED=$(python -c 'import json; d=json.load(open("response.json")); print(d.get("processed", 0))')
+            FAILED=$(python -c 'import json; d=json.load(open("response.json")); print(d.get("failed", 0))')
+            PENDING=$(python -c 'import json; d=json.load(open("response.json")); print(d.get("pending_fixtures", 0))')
+
+            TOTAL_PROCESSED=$((TOTAL_PROCESSED + PROCESSED))
+            TOTAL_FAILED=$((TOTAL_FAILED + FAILED))
+
+            echo ""
+            echo "Procesados en este lote: $PROCESSED"
+            echo "Fallidos en este lote: $FAILED"
+            echo "Pendientes restantes: $PENDING"
+
+            if [ "$PROCESSED" = "0" ]; then
+              echo ""
+              echo "No quedan partidos pendientes."
+              break
+            fi
+
+            if [ "$BATCH" != "8" ]; then
+              echo ""
+              echo "Esperando antes del siguiente lote..."
+              sleep 3
+            fi
+
+          done
 
           echo ""
-          echo "=== CÓDIGO HTTP ==="
-          echo "$HTTP_CODE"
-
-          echo ""
-          echo "=== RESPUESTA ==="
-          cat response.json
-
-          echo ""
-
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "========================================"
-            echo "LOTE SINCRONIZADO CORRECTAMENTE"
-            echo "========================================"
-            echo "API-FOOTBALL"
-            echo "     ↓"
-            echo "ESTADISTICAS"
-            echo "     ↓"
-            echo "BACKEND"
-            echo "     ↓"
-            echo "SUPABASE"
-            echo "========================================"
-          else
-            echo "========================================"
-            echo "ERROR EN EL LOTE"
-            echo "========================================"
-            exit 1
-          fi
+          echo "========================================"
+          echo "SINCRONIZACION TERMINADA"
+          echo "========================================"
+          echo "TOTAL PROCESADOS: $TOTAL_PROCESSED"
+          echo "TOTAL FALLIDOS: $TOTAL_FAILED"
+          echo "========================================"
 
           kill $SERVER_PID || true
