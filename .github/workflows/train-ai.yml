@@ -1,0 +1,38 @@
+name: Entrenar IA Futbol IA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+
+      - name: Entrenar modelo
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          echo "========================================"
+          echo "FUTBOL IA"
+          echo "ENTRENAMIENTO DEL MODELO 1X2"
+          echo "========================================"
+
+          python app/train_ai.py
+
+          echo ""
+          echo "========================================"
+          echo "ENTRENAMIENTO TERMINADO"
+          echo "========================================"
