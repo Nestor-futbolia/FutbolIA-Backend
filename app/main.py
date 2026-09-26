@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 
 app = FastAPI(
     title="Fútbol IA 2.0 API",
-    version="0.2.0"
+    version="0.3.0"
 )
 
 BASE_URL = "https://v3.football.api-sports.io"
@@ -56,6 +56,28 @@ async def football_get(
         )
 
     return data
+
+
+def get_supabase_config():
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SECRET_KEY")
+
+    if not supabase_url or not supabase_key:
+        raise HTTPException(
+            status_code=503,
+            detail="SUPABASE_URL o SUPABASE_SECRET_KEY no configurada"
+        )
+
+    return supabase_url, supabase_key
+
+
+def get_supabase_headers(supabase_key: str):
+    return {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+    }
 
 
 @app.get("/")
@@ -242,20 +264,8 @@ async def sync_league(
         "active": True
     }
 
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SECRET_KEY")
-
-    if not supabase_url or not supabase_key:
-        raise HTTPException(
-            status_code=503,
-            detail="SUPABASE_URL o SUPABASE_SECRET_KEY no configurada"
-        )
-
-    headers = {
-        "apikey": supabase_key,
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates"
-    }
+    supabase_url, supabase_key = get_supabase_config()
+    headers = get_supabase_headers(supabase_key)
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
@@ -274,4 +284,89 @@ async def sync_league(
         "ok": True,
         "message": "Liga sincronizada correctamente",
         "league": row
+    }
+
+
+@app.get("/sync/fixtures")
+async def sync_fixtures(
+    league: int,
+    season: int
+):
+    data = await football_get(
+        "/fixtures",
+        {
+            "league": league,
+            "season": season
+        }
+    )
+
+    fixtures_data = data.get("response", [])
+
+    if not fixtures_data:
+        raise HTTPException(
+            status_code=404,
+            detail="No se encontraron partidos para esta liga y temporada"
+        )
+
+    supabase_url, supabase_key = get_supabase_config()
+    headers = get_supabase_headers(supabase_key)
+
+    rows = []
+
+    for item in fixtures_data:
+        fixture_info = item.get("fixture", {})
+        league_info = item.get("league", {})
+        teams_info = item.get("teams", {})
+        goals_info = item.get("goals", {})
+        score_info = item.get("score", {})
+        halftime_info = score_info.get("halftime", {})
+
+        home_team = teams_info.get("home", {})
+        away_team = teams_info.get("away", {})
+
+        starting_at = fixture_info.get("date")
+
+        row = {
+            "id": fixture_info.get("id"),
+            "league_id": league_info.get("id"),
+            "season_id": league_info.get("season"),
+            "home_team_id": home_team.get("id"),
+            "away_team_id": away_team.get("id"),
+            "starting_at": starting_at,
+            "status": fixture_info.get("status", {}).get("short"),
+            "home_goals": goals_info.get("home"),
+            "away_goals": goals_info.get("away"),
+            "home_ht_goals": halftime_info.get("home"),
+            "away_ht_goals": halftime_info.get("away")
+        }
+
+        if row["id"] is not None:
+            rows.append(row)
+
+    if not rows:
+        raise HTTPException(
+            status_code=502,
+            detail="API-Football devolvió partidos sin identificadores válidos"
+        )
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            f"{supabase_url}/rest/v1/matches",
+            headers=headers,
+            json=rows
+        )
+
+    if response.status_code >= 300:
+        raise HTTPException(
+            status_code=502,
+            detail=response.text[:2000]
+        )
+
+    return {
+        "ok": True,
+        "message": "Partidos sincronizados correctamente",
+        "league": league,
+        "season": season,
+        "matches_received": len(fixtures_data),
+        "matches_saved": len(rows)
     }
