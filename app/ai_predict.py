@@ -43,6 +43,7 @@ async def supabase_get(
     table: str,
     params: dict[str, Any] | None = None,
 ) -> list[dict]:
+
     require_config()
 
     url = f"{SUPABASE_URL}/rest/v1/{table}"
@@ -60,13 +61,19 @@ async def supabase_get(
             f"{response.status_code} {response.text}"
         )
 
-    return response.json()
+    data = response.json()
+
+    if not isinstance(data, list):
+        return []
+
+    return data
 
 
 async def supabase_post(
     table: str,
     payload: dict[str, Any],
 ) -> dict:
+
     require_config()
 
     url = f"{SUPABASE_URL}/rest/v1/{table}"
@@ -95,7 +102,11 @@ async def supabase_post(
     return data
 
 
-def safe_float(value: Any, default: float = 0.0) -> float:
+def safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+
     try:
         return float(value)
     except Exception:
@@ -112,6 +123,7 @@ def rolling_form(
     previous = []
 
     for match in matches:
+
         starting_at = match.get("starting_at")
 
         if not starting_at:
@@ -136,6 +148,7 @@ def rolling_form(
         away_goals = safe_float(away_goals)
 
         if team_id == home_id:
+
             goals_for = home_goals
             goals_against = away_goals
 
@@ -147,6 +160,7 @@ def rolling_form(
                 points = 0
 
         else:
+
             goals_for = away_goals
             goals_against = home_goals
 
@@ -170,11 +184,26 @@ def rolling_form(
     if not previous:
         return 0.0, 0.0, 0.0
 
-    goals_for = sum(x[0] for x in previous) / len(previous)
-    goals_against = sum(x[1] for x in previous) / len(previous)
-    points = sum(x[2] for x in previous) / len(previous)
+    goals_for = (
+        sum(x[0] for x in previous)
+        / len(previous)
+    )
 
-    return goals_for, goals_against, points
+    goals_against = (
+        sum(x[1] for x in previous)
+        / len(previous)
+    )
+
+    points = (
+        sum(x[2] for x in previous)
+        / len(previous)
+    )
+
+    return (
+        goals_for,
+        goals_against,
+        points,
+    )
 
 
 async def load_matches_for_features(
@@ -185,8 +214,13 @@ async def load_matches_for_features(
 
     params = {
         "select": (
-            "id,starting_at,home_team_id,away_team_id,"
-            "home_goals,away_goals,status"
+            "id,"
+            "starting_at,"
+            "home_team_id,"
+            "away_team_id,"
+            "home_goals,"
+            "away_goals,"
+            "status"
         ),
         "starting_at": f"lt.{before_date}",
         "status": "in.(FT,AET,PEN)",
@@ -202,6 +236,7 @@ async def load_matches_for_features(
     relevant = []
 
     for row in rows:
+
         home_id = row.get("home_team_id")
         away_id = row.get("away_team_id")
 
@@ -225,18 +260,26 @@ async def build_features(
     starting_at = match.get("starting_at")
 
     if home_team_id is None:
-        raise RuntimeError("El partido no tiene home_team_id")
+        raise RuntimeError(
+            "El partido no tiene home_team_id"
+        )
 
     if away_team_id is None:
-        raise RuntimeError("El partido no tiene away_team_id")
+        raise RuntimeError(
+            "El partido no tiene away_team_id"
+        )
 
     if not starting_at:
-        raise RuntimeError("El partido no tiene starting_at")
+        raise RuntimeError(
+            "El partido no tiene starting_at"
+        )
 
-    previous_matches = await load_matches_for_features(
-        starting_at,
-        int(home_team_id),
-        int(away_team_id),
+    previous_matches = (
+        await load_matches_for_features(
+            starting_at,
+            int(home_team_id),
+            int(away_team_id),
+        )
     )
 
     (
@@ -268,18 +311,22 @@ async def build_features(
         "away_goals_for_5": away_gf,
         "away_goals_against_5": away_ga,
         "away_points_5": away_points,
+
         "goals_form_difference": (
             (home_gf - home_ga)
             - (away_gf - away_ga)
         ),
+
         "points_form_difference": (
             home_points - away_points
         ),
+
         "home_advantage": 1.0,
     }
 
 
 async def load_active_model() -> dict:
+
     rows = await supabase_get(
         "model_versions",
         {
@@ -302,10 +349,14 @@ async def load_active_model() -> dict:
 
     if not isinstance(metrics, dict):
         raise RuntimeError(
-            "El modelo activo no contiene los parámetros."
+            "El modelo activo no contiene "
+            "los parámetros."
         )
 
-    if metrics.get("model_type") != "logistic_regression":
+    if metrics.get(
+        "model_type"
+    ) != "logistic_regression":
+
         raise RuntimeError(
             "Tipo de modelo no compatible."
         )
@@ -313,16 +364,10 @@ async def load_active_model() -> dict:
     return model
 
 
-def sigmoid(value: float) -> float:
-    if value >= 0:
-        z = math.exp(-value)
-        return 1.0 / (1.0 + z)
+def softmax(
+    values: list[float],
+) -> list[float]:
 
-    z = math.exp(value)
-    return z / (1.0 + z)
-
-
-def softmax(values: list[float]) -> list[float]:
     maximum = max(values)
 
     exp_values = [
@@ -360,40 +405,62 @@ def predict_from_model(
 
     vector = []
 
-    for feature_name in feature_names:
+    for index, feature_name in enumerate(
+        feature_names
+    ):
+
         value = safe_float(
             features.get(feature_name),
             0.0,
         )
 
-        index = feature_names.index(feature_name)
+        mean = safe_float(
+            means[index],
+            0.0,
+        )
 
-        mean = safe_float(means[index])
-        scale = safe_float(scales[index], 1.0)
+        scale = safe_float(
+            scales[index],
+            1.0,
+        )
 
         if scale == 0:
             scale = 1.0
 
         standardized = (
-            (value - mean) / scale
+            (value - mean)
+            / scale
         )
 
-        vector.append(standardized)
+        vector.append(
+            standardized
+        )
 
     scores = []
 
-    for class_index in range(len(classes)):
-        coefficient_row = coefficients[class_index]
+    for class_index in range(
+        len(classes)
+    ):
 
-        score = safe_float(
-            intercept[class_index]
-            if isinstance(intercept, list)
-            else intercept
-        )
+        coefficient_row = coefficients[
+            class_index
+        ]
+
+        if isinstance(intercept, list):
+            score = safe_float(
+                intercept[class_index],
+                0.0,
+            )
+        else:
+            score = safe_float(
+                intercept,
+                0.0,
+            )
 
         for i, coefficient in enumerate(
             coefficient_row
         ):
+
             score += (
                 safe_float(coefficient)
                 * vector[i]
@@ -409,6 +476,7 @@ def predict_from_model(
         classes,
         probabilities,
     ):
+
         result[str(class_name)] = float(
             probability
         )
@@ -445,12 +513,16 @@ async def predict_match(
         "AET",
         "PEN",
     }:
+
         raise RuntimeError(
             "El partido ya terminó. "
-            "No se puede generar una predicción pre-partido."
+            "No se puede generar una "
+            "predicción pre-partido."
         )
 
-    features = await build_features(match)
+    features = await build_features(
+        match
+    )
 
     model = await load_active_model()
 
@@ -459,7 +531,7 @@ async def predict_match(
         features,
     )
 
-    local_probability = probabilities.get(
+    home_probability = probabilities.get(
         "0",
         0.0,
     )
@@ -474,38 +546,69 @@ async def predict_match(
         0.0,
     )
 
-    payload = {
-        "match_id": match_id,
-        "model_version": model["version"],
-        "market": "1X2",
-        "selection": "HOME",
-        "probability": local_probability,
-        "predicted_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
-        "features_snapshot": {
-            "features": features,
-            "probabilities": {
-                "home": local_probability,
-                "draw": draw_probability,
-                "away": away_probability,
-            },
-        },
-    }
+    prediction_time = datetime.now(
+        timezone.utc
+    ).isoformat()
 
-    saved = await supabase_post(
-        "predictions",
-        payload,
-    )
+    prediction_ids = []
+
+    selections = [
+        (
+            "HOME",
+            home_probability,
+        ),
+        (
+            "DRAW",
+            draw_probability,
+        ),
+        (
+            "AWAY",
+            away_probability,
+        ),
+    ]
+
+    for selection, probability in selections:
+
+        payload = {
+            "match_id": match_id,
+            "model_version": model[
+                "version"
+            ],
+            "market": "1X2",
+            "selection": selection,
+            "probability": probability,
+            "predicted_at": prediction_time,
+            "features_snapshot": {
+                "features": features,
+                "probabilities": {
+                    "home": home_probability,
+                    "draw": draw_probability,
+                    "away": away_probability,
+                },
+            },
+        }
+
+        saved = await supabase_post(
+            "predictions",
+            payload,
+        )
+
+        if saved.get("id") is not None:
+            prediction_ids.append(
+                saved["id"]
+            )
 
     return {
         "ok": True,
         "match_id": match_id,
-        "model_version": model["version"],
+        "model_version": model[
+            "version"
+        ],
         "market": "1X2",
+
         "probabilities": {
             "home": round(
-                local_probability * 100,
+                home_probability * 100,
                 2,
             ),
             "draw": round(
@@ -517,6 +620,8 @@ async def predict_match(
                 2,
             ),
         },
+
         "features": features,
-        "prediction_id": saved.get("id"),
-      }
+
+        "prediction_ids": prediction_ids,
+    }
