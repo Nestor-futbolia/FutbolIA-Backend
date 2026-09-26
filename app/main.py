@@ -1,68 +1,76 @@
 import os
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 
+from app.ai_predict import predict_match, load_active_model
 
-# ============================================================
-# CONFIGURACION
-# ============================================================
-
-API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
-
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
-
-
-# ============================================================
-# APP
-# ============================================================
 
 app = FastAPI(
-    title="Futbol IA Backend",
+    title="Fútbol IA 2.0 API",
     version="0.7.0"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+BASE_URL = "https://v3.football.api-sports.io"
 
 
 # ============================================================
-# VALIDACION DE CONFIGURACION
+# CONFIGURACIÓN
 # ============================================================
 
-def require_api_football_key() -> str:
-    if not API_FOOTBALL_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Falta API_FOOTBALL_KEY"
+def get_api_football_key() -> str:
+    key = os.getenv("API_FOOTBALL_KEY", "").strip()
+
+    if not key:
+        raise RuntimeError(
+            "Falta la variable API_FOOTBALL_KEY"
         )
 
-    return API_FOOTBALL_KEY
+    return key
 
 
-def get_supabase_config():
-    if not SUPABASE_URL:
-        raise HTTPException(
-            status_code=500,
-            detail="Falta SUPABASE_URL"
+def get_supabase_config() -> tuple[str, str]:
+    url = os.getenv(
+        "SUPABASE_URL",
+        ""
+    ).strip().rstrip("/")
+
+    key = os.getenv(
+        "SUPABASE_SECRET_KEY",
+        ""
+    ).strip()
+
+    if not url:
+        raise RuntimeError(
+            "Falta la variable SUPABASE_URL"
         )
 
-    if not SUPABASE_SECRET_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="Falta SUPABASE_SECRET_KEY"
+    if not key:
+        raise RuntimeError(
+            "Falta la variable SUPABASE_SECRET_KEY"
         )
 
-    return SUPABASE_URL.rstrip("/"), SUPABASE_SECRET_KEY
+    return url, key
+
+
+def supabase_headers(
+    key: str,
+    prefer: Optional[str] = None
+) -> dict[str, str]:
+
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json"
+    }
+
+    if prefer:
+        headers["Prefer"] = prefer
+
+    return headers
 
 
 # ============================================================
@@ -71,18 +79,24 @@ def get_supabase_config():
 
 async def football_get(
     endpoint: str,
-    params: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+    params: Optional[dict[str, Any]] = None
+) -> dict:
 
-    key = require_api_football_key()
+    api_key = get_api_football_key()
+
+    url = (
+        endpoint
+        if endpoint.startswith("http")
+        else f"{BASE_URL}{endpoint}"
+    )
 
     headers = {
-        "x-apisports-key": key
+        "x-apisports-key": api_key
     }
 
-    url = f"{API_FOOTBALL_BASE_URL}{endpoint}"
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(
+        timeout=60
+    ) as client:
 
         response = await client.get(
             url,
@@ -90,19 +104,21 @@ async def football_get(
             params=params or {}
         )
 
-    if response.status_code != 200:
+    if response.status_code >= 400:
+
         raise HTTPException(
-            status_code=502,
-            detail={
-                "source": "API-Football",
-                "status_code": response.status_code,
-                "response": response.text
-            }
+            status_code=response.status_code,
+            detail=(
+                "API-Football respondió con "
+                f"HTTP {response.status_code}: "
+                f"{response.text}"
+            )
         )
 
     try:
         data = response.json()
     except Exception:
+
         raise HTTPException(
             status_code=502,
             detail="API-Football devolvió una respuesta no válida"
@@ -111,6 +127,7 @@ async def football_get(
     errors = data.get("errors")
 
     if errors:
+
         raise HTTPException(
             status_code=502,
             detail={
@@ -126,177 +143,192 @@ async def football_get(
 # SUPABASE
 # ============================================================
 
-def supabase_headers() -> Dict[str, str]:
+async def supabase_request(
+    method: str,
+    table: str,
+    params: Optional[dict[str, Any]] = None,
+    payload: Optional[Any] = None,
+    prefer: Optional[str] = None
+) -> Any:
 
-    _, key = get_supabase_config()
+    supabase_url, supabase_key = get_supabase_config()
 
-    return {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation"
-    }
+    url = (
+        f"{supabase_url}/rest/v1/{table}"
+    )
+
+    headers = supabase_headers(
+        supabase_key,
+        prefer
+    )
+
+    async with httpx.AsyncClient(
+        timeout=60
+    ) as client:
+
+        response = await client.request(
+            method,
+            url,
+            headers=headers,
+            params=params or {},
+            json=payload
+        )
+
+    if response.status_code >= 400:
+
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=(
+                f"Supabase {method} {table}: "
+                f"{response.text}"
+            )
+        )
+
+    if not response.text:
+        return None
+
+    try:
+        return response.json()
+    except Exception:
+        return response.text
 
 
 async def supabase_get(
     table: str,
-    params: Optional[Dict[str, Any]] = None
-) -> List[Dict[str, Any]]:
+    params: Optional[dict[str, Any]] = None
+) -> list[dict]:
 
-    base_url, _ = get_supabase_config()
+    result = await supabase_request(
+        "GET",
+        table,
+        params=params
+    )
 
-    url = f"{base_url}/rest/v1/{table}"
+    if isinstance(result, list):
+        return result
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-
-        response = await client.get(
-            url,
-            headers=supabase_headers(),
-            params=params or {}
-        )
-
-    if response.status_code not in (200, 206):
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "source": "Supabase",
-                "operation": "GET",
-                "table": table,
-                "status_code": response.status_code,
-                "response": response.text
-            }
-        )
-
-    try:
-        return response.json()
-    except Exception:
-        return []
+    return []
 
 
 async def supabase_upsert(
     table: str,
-    rows: Any,
-    on_conflict: Optional[str] = None
-) -> List[Dict[str, Any]]:
+    payload: dict[str, Any],
+    on_conflict: str
+) -> Any:
 
-    base_url, _ = get_supabase_config()
-
-    url = f"{base_url}/rest/v1/{table}"
-
-    headers = supabase_headers()
-
-    headers["Prefer"] = "resolution=merge-duplicates,return=representation"
-
-    params = {}
-
-    if on_conflict:
-        params["on_conflict"] = on_conflict
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-
-        response = await client.post(
-            url,
-            headers=headers,
-            params=params,
-            json=rows
+    return await supabase_request(
+        "POST",
+        table,
+        params={
+            "on_conflict": on_conflict
+        },
+        payload=payload,
+        prefer=(
+            f"resolution=merge-duplicates,"
+            f"return=representation"
         )
-
-    if response.status_code not in (200, 201):
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "source": "Supabase",
-                "operation": "UPSERT",
-                "table": table,
-                "status_code": response.status_code,
-                "response": response.text
-            }
-        )
-
-    try:
-        return response.json()
-    except Exception:
-        return []
+    )
 
 
 # ============================================================
 # UTILIDADES
 # ============================================================
 
-def clean_number(value: Any) -> Optional[float]:
+def utc_now() -> str:
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+def safe_int(
+    value: Any,
+    default: Optional[int] = None
+) -> Optional[int]:
+
+    try:
+
+        if value is None:
+            return default
+
+        return int(value)
+
+    except Exception:
+        return default
+
+
+def safe_float(
+    value: Any,
+    default: Optional[float] = None
+) -> Optional[float]:
+
+    try:
+
+        if value is None:
+            return default
+
+        return float(value)
+
+    except Exception:
+        return default
+
+
+def clean_text(
+    value: Any
+) -> Optional[str]:
 
     if value is None:
         return None
-
-    if isinstance(value, (int, float)):
-        return float(value)
 
     text = str(value).strip()
 
-    if not text:
-        return None
-
-    text = text.replace("%", "")
-    text = text.replace(",", ".")
-
-    try:
-        return float(text)
-    except Exception:
-        return None
-
-
-def api_stat_to_values(value: Any):
-    numeric = clean_number(value)
-
-    if numeric is not None:
-        return numeric, str(value)
-
-    if value is None:
-        return None, None
-
-    return None, str(value)
+    return text if text else None
 
 
 # ============================================================
-# ROOT
+# ENDPOINT PRINCIPAL
 # ============================================================
 
 @app.get("/")
 async def root():
 
     return {
-        "app": "Futbol IA Backend",
+        "ok": True,
+        "app": "Fútbol IA 2.0",
         "version": "0.7.0",
-        "status": "online"
+        "message": (
+            "Backend funcionando"
+        )
     }
 
-
-# ============================================================
-# HEALTH
-# ============================================================
 
 @app.get("/health")
 async def health():
 
     return {
-        "ok": True
+        "ok": True,
+        "status": "healthy",
+        "app": "Fútbol IA 2.0",
+        "version": "0.7.0",
+        "time": utc_now()
     }
 
 
 # ============================================================
-# API-FOOTBALL: COUNTRIES
+# API-FOOTBALL: PAÍSES
 # ============================================================
 
 @app.get("/countries")
 async def countries():
 
-    return await football_get(
+    data = await football_get(
         "/countries"
     )
 
+    return data
+
 
 # ============================================================
-# API-FOOTBALL: LEAGUES
+# API-FOOTBALL: LIGAS
 # ============================================================
 
 @app.get("/leagues")
@@ -305,7 +337,7 @@ async def leagues(
     season: Optional[int] = None
 ):
 
-    params = {}
+    params: dict[str, Any] = {}
 
     if country:
         params["country"] = country
@@ -327,12 +359,14 @@ async def leagues(
 async def fixtures(
     league: Optional[int] = None,
     season: Optional[int] = None,
-    date: Optional[str] = None,
     team: Optional[int] = None,
+    date: Optional[str] = None,
+    next: Optional[int] = None,
+    last: Optional[int] = None,
     status: Optional[str] = None
 ):
 
-    params = {}
+    params: dict[str, Any] = {}
 
     if league is not None:
         params["league"] = league
@@ -340,11 +374,17 @@ async def fixtures(
     if season is not None:
         params["season"] = season
 
+    if team is not None:
+        params["team"] = team
+
     if date:
         params["date"] = date
 
-    if team is not None:
-        params["team"] = team
+    if next is not None:
+        params["next"] = next
+
+    if last is not None:
+        params["last"] = last
 
     if status:
         params["status"] = status
@@ -356,11 +396,11 @@ async def fixtures(
 
 
 # ============================================================
-# API-FOOTBALL: FIXTURE DETAIL
+# FIXTURE INDIVIDUAL
 # ============================================================
 
 @app.get("/fixtures/{fixture_id}")
-async def fixture_detail(
+async def fixture(
     fixture_id: int
 ):
 
@@ -373,11 +413,11 @@ async def fixture_detail(
 
 
 # ============================================================
-# API-FOOTBALL: TEAM
+# EQUIPO
 # ============================================================
 
 @app.get("/teams/{team_id}")
-async def team_detail(
+async def team(
     team_id: int
 ):
 
@@ -390,7 +430,7 @@ async def team_detail(
 
 
 # ============================================================
-# API-FOOTBALL: STANDINGS
+# STANDINGS
 # ============================================================
 
 @app.get("/standings")
@@ -409,27 +449,27 @@ async def standings(
 
 
 # ============================================================
-# API-FOOTBALL: INJURIES
+# LESIONES
 # ============================================================
 
 @app.get("/injuries")
 async def injuries(
-    fixture: Optional[int] = None,
     league: Optional[int] = None,
     season: Optional[int] = None,
+    fixture: Optional[int] = None,
     team: Optional[int] = None
 ):
 
-    params = {}
-
-    if fixture is not None:
-        params["fixture"] = fixture
+    params: dict[str, Any] = {}
 
     if league is not None:
         params["league"] = league
 
     if season is not None:
         params["season"] = season
+
+    if fixture is not None:
+        params["fixture"] = fixture
 
     if team is not None:
         params["team"] = team
@@ -441,7 +481,7 @@ async def injuries(
 
 
 # ============================================================
-# API-FOOTBALL: ODDS
+# CUOTAS
 # ============================================================
 
 @app.get("/odds")
@@ -451,7 +491,7 @@ async def odds(
     season: Optional[int] = None
 ):
 
-    params = {}
+    params: dict[str, Any] = {}
 
     if fixture is not None:
         params["fixture"] = fixture
@@ -486,20 +526,39 @@ async def sync_league(
         }
     )
 
-    response = data.get("response", [])
+    response = data.get(
+        "response",
+        []
+    )
 
     if not response:
+
         raise HTTPException(
             status_code=404,
-            detail="Liga no encontrada"
+            detail=(
+                "No se encontró la liga "
+                "o la temporada"
+            )
         )
 
-    league_data = response[0]
+    item = response[0]
 
-    league_info = league_data.get("league", {})
-    country_info = league_data.get("country", {})
+    league_info = item.get(
+        "league",
+        {}
+    )
 
-    league_row = {
+    country_info = item.get(
+        "country",
+        {}
+    )
+
+    seasons = item.get(
+        "seasons",
+        []
+    )
+
+    league_payload = {
         "id": league_info.get("id"),
         "name": league_info.get("name"),
         "country": country_info.get("name"),
@@ -507,28 +566,74 @@ async def sync_league(
         "active": True
     }
 
+    if league_payload["id"] is None:
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "API-Football no devolvió "
+                "el ID de la liga"
+            )
+        )
+
     await supabase_upsert(
         "leagues",
-        league_row,
+        league_payload,
         "id"
     )
 
-    season_row = {
-        "id": season,
+    selected_season = None
+
+    for season_info in seasons:
+
+        if season_info.get("year") == season:
+
+            selected_season = season_info
+            break
+
+    if selected_season is None:
+
+        selected_season = {
+            "year": season
+        }
+
+    season_id = selected_season.get(
+        "id"
+    )
+
+    if season_id is None:
+
+        season_id = (
+            league * 10000
+            + season
+        )
+
+    season_payload = {
+        "id": season_id,
         "league_id": league,
-        "name": str(season)
+        "name": str(season),
+        "starting_at": (
+            selected_season.get(
+                "start"
+            )
+        ),
+        "ending_at": (
+            selected_season.get(
+                "end"
+            )
+        )
     }
 
     await supabase_upsert(
         "seasons",
-        season_row,
+        season_payload,
         "id"
     )
 
     return {
         "ok": True,
-        "league": league_row,
-        "season": season_row
+        "league": league_payload,
+        "season": season_payload
     }
 
 
@@ -555,42 +660,63 @@ async def sync_teams(
         }
     )
 
-    response = data.get("response", [])
+    response = data.get(
+        "response",
+        []
+    )
 
-    rows = []
+    saved = 0
 
     for item in response:
 
-        team = item.get("team", {})
-        venue = item.get("venue", {})
+        team_info = item.get(
+            "team",
+            {}
+        )
 
-        team_id = team.get("id")
+        venue_info = item.get(
+            "venue",
+            {}
+        )
+
+        team_id = team_info.get(
+            "id"
+        )
 
         if team_id is None:
             continue
 
-        rows.append({
+        payload = {
             "id": team_id,
-            "name": team.get("name") or "Sin nombre",
-            "short_code": team.get("code"),
-            "country": team.get("country"),
-            "venue_name": venue.get("name"),
+            "name": team_info.get(
+                "name"
+            ),
+            "short_code": team_info.get(
+                "code"
+            ),
+            "country": team_info.get(
+                "country"
+            ),
+            "venue_name": venue_info.get(
+                "name"
+            ),
             "league_id": league
-        })
-
-    if rows:
+        }
 
         await supabase_upsert(
             "teams",
-            rows,
+            payload,
             "id"
         )
+
+        saved += 1
 
     return {
         "ok": True,
         "league": league,
         "season": season,
-        "teams": len(rows)
+        "teams_received": len(response),
+        "teams_saved": saved
     }
 
 
@@ -603,11 +729,6 @@ async def sync_fixtures(
     league: int,
     season: int
 ):
-
-    await sync_league(
-        league=league,
-        season=season
-    )
 
     await sync_teams(
         league=league,
@@ -622,65 +743,202 @@ async def sync_fixtures(
         }
     )
 
-    response = data.get("response", [])
+    response = data.get(
+        "response",
+        []
+    )
 
-    rows = []
+    if not response:
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No se encontraron fixtures"
+            )
+        )
+
+    saved = 0
+    skipped = 0
 
     for item in response:
 
-        fixture = item.get("fixture", {})
-        teams = item.get("teams", {})
-        goals = item.get("goals", {})
-        score = item.get("score", {})
+        fixture_info = item.get(
+            "fixture",
+            {}
+        )
 
-        fixture_id = fixture.get("id")
+        league_info = item.get(
+            "league",
+            {}
+        )
 
-        home = teams.get("home", {})
-        away = teams.get("away", {})
+        teams_info = item.get(
+            "teams",
+            {}
+        )
 
-        home_id = home.get("id")
-        away_id = away.get("id")
+        goals_info = item.get(
+            "goals",
+            {}
+        )
 
-        if fixture_id is None:
+        score_info = item.get(
+            "score",
+            {}
+        )
+
+        fixture_id = fixture_info.get(
+            "id"
+        )
+
+        home_team = teams_info.get(
+            "home",
+            {}
+        )
+
+        away_team = teams_info.get(
+            "away",
+            {}
+        )
+
+        home_team_id = home_team.get(
+            "id"
+        )
+
+        away_team_id = away_team.get(
+            "id"
+        )
+
+        if (
+            fixture_id is None
+            or home_team_id is None
+            or away_team_id is None
+        ):
+
+            skipped += 1
             continue
 
-        if home_id is None or away_id is None:
-            continue
+        season_id = (
+            league_info.get(
+                "season"
+            )
+        )
 
-        halftime = score.get("halftime", {})
+        if season_id is None:
 
-        rows.append({
+            season_id = (
+                league * 10000
+                + season
+            )
+
+        referee_id = None
+
+        referee_name = clean_text(
+            fixture_info.get(
+                "referee"
+            )
+        )
+
+        if referee_name:
+
+            referee_rows = await supabase_get(
+                "referees",
+                {
+                    "select": "id",
+                    "name": f"eq.{referee_name}",
+                    "limit": "1"
+                }
+            )
+
+            if referee_rows:
+
+                referee_id = referee_rows[0][
+                    "id"
+                ]
+
+            else:
+
+                referee_result = (
+                    await supabase_request(
+                        "POST",
+                        "referees",
+                        payload={
+                            "name": referee_name
+                        },
+                        prefer=(
+                            "return=representation"
+                        )
+                    )
+                )
+
+                if (
+                    isinstance(
+                        referee_result,
+                        list
+                    )
+                    and referee_result
+                ):
+
+                    referee_id = (
+                        referee_result[0].get(
+                            "id"
+                        )
+                    )
+
+        payload = {
             "id": fixture_id,
             "league_id": league,
-            "season_id": season,
-            "home_team_id": home_id,
-            "away_team_id": away_id,
-            "starting_at": fixture.get("date"),
-            "status": fixture.get("status", {}).get("short"),
-            "home_goals": goals.get("home"),
-            "away_goals": goals.get("away"),
-            "home_ht_goals": halftime.get("home"),
-            "away_ht_goals": halftime.get("away")
-        })
-
-    if rows:
+            "season_id": season_id,
+            "home_team_id": home_team_id,
+            "away_team_id": away_team_id,
+            "referee_id": referee_id,
+            "starting_at": fixture_info.get(
+                "date"
+            ),
+            "status": (
+                fixture_info
+                .get("status", {})
+                .get("short")
+            ),
+            "home_goals": goals_info.get(
+                "home"
+            ),
+            "away_goals": goals_info.get(
+                "away"
+            ),
+            "home_ht_goals": (
+                score_info
+                .get("halftime", {})
+                .get("home")
+            ),
+            "away_ht_goals": (
+                score_info
+                .get("halftime", {})
+                .get("away")
+            ),
+            "updated_at": utc_now()
+        }
 
         await supabase_upsert(
             "matches",
-            rows,
+            payload,
             "id"
         )
+
+        saved += 1
 
     return {
         "ok": True,
         "league": league,
         "season": season,
-        "fixtures": len(rows)
+        "fixtures_received": len(response),
+        "fixtures_saved": saved,
+        "fixtures_skipped": skipped
     }
 
 
 # ============================================================
-# SINCRONIZAR ESTADISTICAS DE UN PARTIDO
+# SINCRONIZAR ESTADÍSTICAS DE UN PARTIDO
 # ============================================================
 
 @app.get("/sync/statistics")
@@ -688,357 +946,150 @@ async def sync_statistics(
     fixture: int
 ):
 
-    # --------------------------------------------------------
-    # Obtener información del partido
-    # --------------------------------------------------------
-
-    fixture_data = await football_get(
-        "/fixtures",
-        {
-            "id": fixture
-        }
-    )
-
-    fixture_response = fixture_data.get("response", [])
-
-    if not fixture_response:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No se encontró el fixture {fixture}"
-        )
-
-    fixture_item = fixture_response[0]
-
-    fixture_info = fixture_item.get("fixture", {})
-    league_info = fixture_item.get("league", {})
-    teams_info = fixture_item.get("teams", {})
-    goals_info = fixture_item.get("goals", {})
-    score_info = fixture_item.get("score", {})
-
-    league_id = league_info.get("id")
-    season = league_info.get("season")
-
-    home_team = teams_info.get("home", {})
-    away_team = teams_info.get("away", {})
-
-    home_team_id = home_team.get("id")
-    away_team_id = away_team.get("id")
-
-    if not league_id or not season:
-        raise HTTPException(
-            status_code=502,
-            detail="El fixture no contiene liga o temporada"
-        )
-
-    if not home_team_id or not away_team_id:
-        raise HTTPException(
-            status_code=502,
-            detail="El fixture no contiene los equipos"
-        )
-
-    # --------------------------------------------------------
-    # Asegurar liga
-    # --------------------------------------------------------
-
-    league_row = {
-        "id": league_id,
-        "name": league_info.get("name"),
-        "country": None,
-        "type": league_info.get("type"),
-        "active": True
-    }
-
-    await supabase_upsert(
-        "leagues",
-        league_row,
-        "id"
-    )
-
-    # --------------------------------------------------------
-    # Asegurar temporada
-    # --------------------------------------------------------
-
-    season_row = {
-        "id": season,
-        "league_id": league_id,
-        "name": str(season)
-    }
-
-    await supabase_upsert(
-        "seasons",
-        season_row,
-        "id"
-    )
-
-    # --------------------------------------------------------
-    # Asegurar equipos
-    # --------------------------------------------------------
-
-    teams_rows = [
-        {
-            "id": home_team_id,
-            "name": home_team.get("name") or "Local",
-            "short_code": home_team.get("code"),
-            "country": None,
-            "venue_name": None,
-            "league_id": league_id
-        },
-        {
-            "id": away_team_id,
-            "name": away_team.get("name") or "Visitante",
-            "short_code": away_team.get("code"),
-            "country": None,
-            "venue_name": None,
-            "league_id": league_id
-        }
-    ]
-
-    await supabase_upsert(
-        "teams",
-        teams_rows,
-        "id"
-    )
-
-    # --------------------------------------------------------
-    # Asegurar partido
-    # --------------------------------------------------------
-
-    halftime = score_info.get("halftime", {})
-
-    match_row = {
-        "id": fixture,
-        "league_id": league_id,
-        "season_id": season,
-        "home_team_id": home_team_id,
-        "away_team_id": away_team_id,
-        "starting_at": fixture_info.get("date"),
-        "status": fixture_info.get("status", {}).get("short"),
-        "home_goals": goals_info.get("home"),
-        "away_goals": goals_info.get("away"),
-        "home_ht_goals": halftime.get("home"),
-        "away_ht_goals": halftime.get("away")
-    }
-
-    await supabase_upsert(
-        "matches",
-        match_row,
-        "id"
-    )
-
-    # --------------------------------------------------------
-    # Obtener estadísticas
-    # --------------------------------------------------------
-
-    statistics_data = await football_get(
+    data = await football_get(
         "/fixtures/statistics",
         {
             "fixture": fixture
         }
     )
 
-    statistics_response = statistics_data.get("response", [])
+    response = data.get(
+        "response",
+        []
+    )
 
-    if not statistics_response:
-        return {
-            "ok": True,
-            "fixture": fixture,
-            "statistics": 0,
-            "message": "API-Football no devolvió estadísticas"
-        }
+    if not response:
 
-    rows = []
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No se encontraron estadísticas "
+                f"para el fixture {fixture}"
+            )
+        )
 
-    for team_block in statistics_response:
+    saved = 0
 
-        team = team_block.get("team", {})
-        team_id = team.get("id")
+    for team_block in response:
 
-        if not team_id:
+        team_info = team_block.get(
+            "team",
+            {}
+        )
+
+        team_id = team_info.get(
+            "id"
+        )
+
+        if team_id is None:
             continue
 
-        statistics = team_block.get("statistics", [])
+        statistics = team_block.get(
+            "statistics",
+            []
+        )
 
         for stat in statistics:
 
-            stat_type = stat.get("type")
-            value = stat.get("value")
+            stat_type = clean_text(
+                stat.get("type")
+            )
+
+            value = stat.get(
+                "value"
+            )
 
             if not stat_type:
                 continue
 
-            numeric_value, text_value = api_stat_to_values(
-                value
-            )
+            numeric_value = None
+            text_value = None
 
-            rows.append({
+            if isinstance(
+                value,
+                (int, float)
+            ):
+
+                numeric_value = float(
+                    value
+                )
+
+            elif isinstance(
+                value,
+                str
+            ):
+
+                cleaned = (
+                    value
+                    .replace("%", "")
+                    .replace(",", ".")
+                    .strip()
+                )
+
+                try:
+                    numeric_value = float(
+                        cleaned
+                    )
+                except Exception:
+                    text_value = value
+
+            payload = {
                 "match_id": fixture,
                 "team_id": team_id,
                 "stat_type": stat_type,
                 "value_numeric": numeric_value,
                 "value_text": text_value
-            })
+            }
 
-    if rows:
+            await supabase_upsert(
+                "match_statistics",
+                payload,
+                "match_id,team_id,stat_type"
+            )
 
-        await supabase_upsert(
-            "match_statistics",
-            rows,
-            "match_id,team_id,stat_type"
-        )
+            saved += 1
 
     return {
         "ok": True,
         "fixture": fixture,
-        "statistics": len(rows)
+        "teams": len(response),
+        "statistics_saved": saved
     }
 
 
 # ============================================================
-# ESTADISTICAS DE MUESTRA
-# ============================================================
-
-@app.get("/sync/statistics/sample")
-async def sync_statistics_sample(
-    league: int,
-    season: int,
-    limit: int = 1
-):
-
-    if limit < 1 or limit > 5:
-        raise HTTPException(
-            status_code=400,
-            detail="El límite debe estar entre 1 y 5"
-        )
-
-    data = await football_get(
-        "/fixtures",
-        {
-            "league": league,
-            "season": season
-        }
-    )
-
-    fixtures_data = data.get("response", [])
-
-    finished_statuses = {
-        "FT",
-        "AET",
-        "PEN"
-    }
-
-    selected = []
-
-    for item in fixtures_data:
-
-        fixture_info = item.get("fixture", {})
-        status = fixture_info.get("status", {}).get("short")
-        fixture_id = fixture_info.get("id")
-
-        if (
-            status in finished_statuses
-            and fixture_id is not None
-        ):
-            selected.append(fixture_id)
-
-        if len(selected) >= limit:
-            break
-
-    if not selected:
-        raise HTTPException(
-            status_code=404,
-            detail="No se encontraron partidos terminados"
-        )
-
-    processed = []
-    failed = []
-
-    for fixture_id in selected:
-
-        try:
-
-            result = await sync_statistics(
-                fixture=fixture_id
-            )
-
-            processed.append({
-                "fixture": fixture_id,
-                "status": "ok",
-                "result": result
-            })
-
-        except Exception as exc:
-
-            failed.append({
-                "fixture": fixture_id,
-                "status": "error",
-                "detail": str(exc)
-            })
-
-    return {
-        "ok": True,
-        "league": league,
-        "season": season,
-        "selected": selected,
-        "processed": processed,
-        "failed": failed
-    }
-
-
-# ============================================================
-# OBTENER FIXTURES QUE YA TIENEN ESTADISTICAS
+# FIXTURES QUE YA TIENEN ESTADÍSTICAS
 # ============================================================
 
 async def get_saved_statistic_fixture_ids(
     supabase_url: str,
     supabase_key: str
-) -> set:
+) -> set[int]:
 
-    url = f"{supabase_url}/rest/v1/match_statistics"
+    rows = await supabase_get(
+        "match_statistics",
+        {
+            "select": "match_id",
+            "limit": "10000"
+        }
+    )
 
-    headers = {
-        "apikey": supabase_key,
-        "Authorization": f"Bearer {supabase_key}"
-    }
+    result: set[int] = set()
 
-    params = {
-        "select": "match_id",
-        "limit": "10000"
-    }
+    for row in rows:
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-
-        response = await client.get(
-            url,
-            headers=headers,
-            params=params
+        match_id = safe_int(
+            row.get("match_id")
         )
 
-    if response.status_code not in (200, 206):
+        if match_id is not None:
+            result.add(match_id)
 
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "source": "Supabase",
-                "operation": "GET match_statistics",
-                "status_code": response.status_code,
-                "response": response.text
-            }
-        )
-
-    try:
-        data = response.json()
-    except Exception:
-        data = []
-
-    return {
-        int(row["match_id"])
-        for row in data
-        if row.get("match_id") is not None
-    }
+    return result
 
 
 # ============================================================
-# SINCRONIZACION DE ESTADISTICAS POR LOTE
+# SINCRONIZACIÓN DE ESTADÍSTICAS POR LOTES
 # ============================================================
 
 @app.get("/sync/statistics/batch")
@@ -1048,20 +1099,15 @@ async def sync_statistics_batch(
     limit: int = 5
 ):
 
-    # --------------------------------------------------------
-    # Validar limite
-    # --------------------------------------------------------
-
     if limit < 1 or limit > 10:
 
         raise HTTPException(
             status_code=400,
-            detail="El límite debe estar entre 1 y 10"
+            detail=(
+                "El límite debe estar "
+                "entre 1 y 10"
+            )
         )
-
-    # --------------------------------------------------------
-    # Obtener partidos de la liga y temporada
-    # --------------------------------------------------------
 
     data = await football_get(
         "/fixtures",
@@ -1080,12 +1126,11 @@ async def sync_statistics_batch(
 
         raise HTTPException(
             status_code=404,
-            detail="No se encontraron partidos para esta liga y temporada"
+            detail=(
+                "No se encontraron partidos "
+                "para esta liga y temporada"
+            )
         )
-
-    # --------------------------------------------------------
-    # Filtrar partidos terminados
-    # --------------------------------------------------------
 
     finished_statuses = {
         "FT",
@@ -1111,61 +1156,56 @@ async def sync_statistics_batch(
             "short"
         )
 
-        fixture_id = fixture_info.get(
-            "id"
-        )
+        if status_short in finished_statuses:
 
-        if (
-            status_short in finished_statuses
-            and fixture_id is not None
-        ):
+            fixture_id = fixture_info.get(
+                "id"
+            )
 
-            finished_fixtures.append({
-                "id": fixture_id,
-                "status": status_short,
-                "date": fixture_info.get("date")
-            })
+            if fixture_id is not None:
+
+                finished_fixtures.append({
+                    "id": fixture_id,
+                    "status": status_short,
+                    "date": fixture_info.get(
+                        "date"
+                    )
+                })
 
     if not finished_fixtures:
 
         raise HTTPException(
             status_code=404,
-            detail="No se encontraron partidos terminados"
+            detail=(
+                "No se encontraron partidos "
+                "terminados"
+            )
         )
 
-    # --------------------------------------------------------
-    # Consultar partidos que ya tienen estadísticas
-    # --------------------------------------------------------
-
-    supabase_url, supabase_key = get_supabase_config()
-
-    saved_fixture_ids = await get_saved_statistic_fixture_ids(
-        supabase_url,
-        supabase_key
+    supabase_url, supabase_key = (
+        get_supabase_config()
     )
 
-    # --------------------------------------------------------
-    # Dejar solamente partidos pendientes
-    # --------------------------------------------------------
+    saved_fixture_ids = (
+        await get_saved_statistic_fixture_ids(
+            supabase_url,
+            supabase_key
+        )
+    )
 
     pending_fixtures = [
         item
         for item in finished_fixtures
-        if item["id"] not in saved_fixture_ids
+        if item["id"]
+        not in saved_fixture_ids
     ]
 
-    # --------------------------------------------------------
-    # Aplicar limite
-    # --------------------------------------------------------
-
-    selected_fixtures = pending_fixtures[:limit]
+    selected_fixtures = (
+        pending_fixtures[:limit]
+    )
 
     processed = []
     failed = []
-
-    # --------------------------------------------------------
-    # Sincronizar uno por uno
-    # --------------------------------------------------------
 
     for item in selected_fixtures:
 
@@ -1200,10 +1240,6 @@ async def sync_statistics_batch(
                 "detail": str(exc)
             })
 
-    # --------------------------------------------------------
-    # Resultado
-    # --------------------------------------------------------
-
     return {
         "ok": True,
         "league": league,
@@ -1232,3 +1268,75 @@ async def sync_statistics_batch(
             "failed": failed
         }
     }
+
+
+# ============================================================
+# IA — ESTADO DEL MODELO
+# ============================================================
+
+@app.get("/ai/status")
+async def ai_status():
+
+    try:
+
+        model = await load_active_model()
+
+        metrics = model.get(
+            "metrics",
+            {}
+        )
+
+        return {
+            "ok": True,
+            "active": True,
+            "model_version": model.get(
+                "version"
+            ),
+            "model_name": model.get(
+                "model_name"
+            ),
+            "trained_at": model.get(
+                "trained_at"
+            ),
+            "training_matches": model.get(
+                "training_matches"
+            ),
+            "validation_accuracy": metrics.get(
+                "validation_accuracy"
+            ),
+            "validation_log_loss": metrics.get(
+                "validation_log_loss"
+            )
+        }
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc)
+        )
+
+
+# ============================================================
+# IA — PREDICCIÓN 1X2
+# ============================================================
+
+@app.get("/ai/predict/{match_id}")
+async def ai_predict(
+    match_id: int
+):
+
+    try:
+
+        result = await predict_match(
+            match_id
+        )
+
+        return result
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc)
+        )
