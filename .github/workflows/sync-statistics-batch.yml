@@ -48,29 +48,28 @@ jobs:
 
           echo ""
           echo "========================================"
-          echo "INICIANDO SINCRONIZACION HISTORICA"
+          echo "SINCRONIZACION CONTROLADA"
           echo "Liga: 140"
           echo "Temporada: 2024"
-          echo "Lotes: 8"
-          echo "Partidos por lote: 10"
-          echo "Maximo teorico: 80 partidos"
+          echo "Partidos por lote: 4"
+          echo "Espera entre lotes: 70 segundos"
           echo "========================================"
 
           TOTAL_PROCESSED=0
           TOTAL_FAILED=0
 
-          for BATCH in 1 2 3 4 5 6 7 8
+          for BATCH in 1 2 3 4 5 6 7 8 9 10
           do
 
             echo ""
             echo "========================================"
-            echo "LOTE $BATCH DE 8"
+            echo "LOTE $BATCH DE 10"
             echo "========================================"
 
             HTTP_CODE=$(curl -s \
               -o response.json \
               -w "%{http_code}" \
-              "http://127.0.0.1:8000/sync/statistics/batch?league=140&season=2024&limit=10")
+              "http://127.0.0.1:8000/sync/statistics/batch?league=140&season=2024&limit=4")
 
             echo ""
             echo "CODIGO HTTP: $HTTP_CODE"
@@ -84,7 +83,6 @@ jobs:
             if [ "$HTTP_CODE" != "200" ]; then
               echo ""
               echo "ERROR EN EL LOTE $BATCH"
-              echo "Se detiene la sincronizacion para proteger el limite de API."
               cat response.json
               kill $SERVER_PID || true
               exit 1
@@ -102,16 +100,24 @@ jobs:
             echo "Fallidos en este lote: $FAILED"
             echo "Pendientes restantes: $PENDING"
 
+            if [ "$FAILED" != "0" ]; then
+              echo ""
+              echo "Se detectaron errores."
+              echo "Se detiene para proteger el limite de API."
+              kill $SERVER_PID || true
+              exit 1
+            fi
+
             if [ "$PROCESSED" = "0" ]; then
               echo ""
               echo "No quedan partidos pendientes."
               break
             fi
 
-            if [ "$BATCH" != "8" ]; then
+            if [ "$BATCH" != "10" ]; then
               echo ""
-              echo "Esperando antes del siguiente lote..."
-              sleep 3
+              echo "Esperando 70 segundos..."
+              sleep 70
             fi
 
           done
