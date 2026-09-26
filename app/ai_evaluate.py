@@ -1,6 +1,7 @@
 import os
 import math
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
@@ -101,6 +102,7 @@ def get_actual_result(
     home_goals: Optional[int],
     away_goals: Optional[int],
 ) -> Optional[str]:
+
     if home_goals is None or away_goals is None:
         return None
 
@@ -111,6 +113,143 @@ def get_actual_result(
         return "DRAW"
 
     return "AWAY"
+
+
+# ============================================================
+# PREDICCIONES PARA PARTIDOS FUTUROS
+# ============================================================
+
+@router.get("/predict/upcoming")
+async def predict_upcoming(
+    limit: int = Query(
+        10,
+        ge=1,
+        le=50,
+        description="Cantidad máxima de partidos futuros",
+    )
+):
+    """
+    Busca partidos cuyo inicio todavía no ha ocurrido
+    y genera automáticamente una predicción 1X2.
+
+    No utiliza el marcador final porque estos partidos
+    todavía no han comenzado.
+    """
+
+    now_utc = datetime.now(timezone.utc)
+
+    matches = await supabase_get(
+        "matches",
+        {
+            "select": (
+                "id,status,home_goals,away_goals,"
+                "starting_at,home_team_id,away_team_id"
+            ),
+            "starting_at": f"gte.{now_utc.isoformat()}",
+            "order": "starting_at.asc",
+            "limit": str(limit),
+        },
+    )
+
+    selected = len(matches)
+    predicted = 0
+    skipped = 0
+    failed = 0
+
+    details = []
+
+    for match in matches:
+        match_id = match.get("id")
+
+        if match_id is None:
+            continue
+
+        match_id = int(match_id)
+
+        try:
+            existing = await supabase_get(
+                "predictions",
+                {
+                    "select": (
+                        "id,model_version,"
+                        "market,selection,probability"
+                    ),
+                    "match_id": f"eq.{match_id}",
+                    "market": "eq.1X2",
+                    "limit": "1",
+                },
+            )
+
+            if existing:
+                skipped += 1
+
+                details.append(
+                    {
+                        "match_id": match_id,
+                        "starting_at": match.get(
+                            "starting_at"
+                        ),
+                        "ok": True,
+                        "status": "skipped",
+                        "reason": (
+                            "Ya existen predicciones 1X2"
+                        ),
+                    }
+                )
+
+                continue
+
+            result = await predict_match(match_id)
+
+            predicted += 1
+
+            details.append(
+                {
+                    "match_id": match_id,
+                    "starting_at": match.get(
+                        "starting_at"
+                    ),
+                    "ok": True,
+                    "status": "predicted",
+                    "prediction": result.get(
+                        "prediction"
+                    ),
+                    "prediction_percentage": result.get(
+                        "prediction_percentage"
+                    ),
+                    "probabilities": result.get(
+                        "probabilities"
+                    ),
+                    "model_version": result.get(
+                        "model_version"
+                    ),
+                }
+            )
+
+        except Exception as exc:
+            failed += 1
+
+            details.append(
+                {
+                    "match_id": match_id,
+                    "starting_at": match.get(
+                        "starting_at"
+                    ),
+                    "ok": False,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+
+    return {
+        "ok": True,
+        "current_time_utc": now_utc.isoformat(),
+        "selected": selected,
+        "predicted": predicted,
+        "skipped": skipped,
+        "failed": failed,
+        "details": details,
+    }
 
 
 # ============================================================
@@ -224,7 +363,7 @@ async def predict_batch(
 
 
 # ============================================================
-# EVALUAR VARIOS PARTIDOS
+# EVALUAR UN PARTIDO
 # ============================================================
 
 async def evaluate_match_internal(
@@ -447,6 +586,10 @@ async def evaluate_match_internal(
     }
 
 
+# ============================================================
+# EVALUAR VARIOS PARTIDOS
+# ============================================================
+
 @router.get("/evaluate/batch")
 async def evaluate_batch(
     limit: int = Query(
@@ -555,7 +698,7 @@ async def evaluate_match(match_id: int):
 
 
 # ============================================================
-# RESULTADOS DE PREDICCIONES
+# OBTENER RESULTADOS DE PREDICCIONES
 # ============================================================
 
 async def get_all_prediction_results(
@@ -884,7 +1027,10 @@ async def ai_performance(
         / len(log_loss_values)
     )
 
-    # Brier Score
+    # ========================================================
+    # BRIER SCORE
+    # ========================================================
+
     brier_values = []
 
     grouped_brier = defaultdict(list)
@@ -999,7 +1145,10 @@ async def ai_performance(
         else None
     )
 
-    # Resumen por modelo
+    # ========================================================
+    # RESUMEN POR MODELO
+    # ========================================================
+
     models_grouped = defaultdict(list)
 
     for record in match_records:
