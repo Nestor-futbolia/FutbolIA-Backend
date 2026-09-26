@@ -1,16 +1,15 @@
-import math
 import os
+import math
 from collections import defaultdict
-from datetime import datetime, timezone
+from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
+
+from app.ai_predict import predict_match
 
 
-router = APIRouter(
-    prefix="/ai",
-    tags=["AI"]
-)
+router = APIRouter(prefix="/ai", tags=["AI"])
 
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
@@ -19,98 +18,218 @@ SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
 FINAL_STATUSES = {"FT", "AET", "PEN"}
 
 
-# ============================================================
-# SUPABASE
-# ============================================================
-
-def supabase_headers(prefer: str | None = None):
+def supabase_headers() -> dict[str, str]:
     if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
         raise RuntimeError(
             "Faltan SUPABASE_URL o SUPABASE_SECRET_KEY"
         )
 
-    headers = {
+    return {
         "apikey": SUPABASE_SECRET_KEY,
         "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
         "Content-Type": "application/json",
     }
 
-    if prefer:
-        headers["Prefer"] = prefer
 
-    return headers
-
-
-async def supabase_get(table: str, params: dict):
+async def supabase_get(
+    table: str,
+    params: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
     url = f"{SUPABASE_URL}/rest/v1/{table}"
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(
             url,
             headers=supabase_headers(),
-            params=params,
+            params=params or {},
         )
 
     if response.status_code >= 400:
-        raise RuntimeError(
-            f"Supabase GET {table}: "
-            f"{response.status_code} {response.text}"
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Supabase GET {table}: "
+                f"{response.status_code} {response.text}"
+            ),
         )
 
-    if not response.text:
+    data = response.json()
+
+    if not isinstance(data, list):
         return []
 
-    return response.json()
+    return data
 
 
-async def supabase_post(table: str, payload):
+async def supabase_post(
+    table: str,
+    payload: Any,
+) -> list[dict[str, Any]]:
     url = f"{SUPABASE_URL}/rest/v1/{table}"
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    headers = supabase_headers()
+    headers["Prefer"] = "return=representation"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             url,
-            headers=supabase_headers("return=representation"),
+            headers=headers,
             json=payload,
         )
 
     if response.status_code >= 400:
-        raise RuntimeError(
-            f"Supabase POST {table}: "
-            f"{response.status_code} {response.text}"
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Supabase POST {table}: "
+                f"{response.status_code} {response.text}"
+            ),
         )
 
     if not response.text:
         return []
 
-    return response.json()
+    data = response.json()
+
+    if isinstance(data, list):
+        return data
+
+    return []
 
 
-# ============================================================
-# UTILIDADES
-# ============================================================
-
-def get_actual_result(home_goals, away_goals):
+def get_actual_result(
+    home_goals: Optional[int],
+    away_goals: Optional[int],
+) -> Optional[str]:
     if home_goals is None or away_goals is None:
         return None
 
     if home_goals > away_goals:
         return "HOME"
 
-    if home_goals < away_goals:
-        return "AWAY"
+    if home_goals == away_goals:
+        return "DRAW"
 
-    return "DRAW"
-
-
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
+    return "AWAY"
 
 
 # ============================================================
-# EVALUAR UN PARTIDO
+# GENERAR PREDICCIONES 1X2 EN LOTE
 # ============================================================
 
-async def evaluate_match_internal(match_id: int):
+@router.get("/predict/batch")
+async def predict_batch(
+    limit: int = Query(
+        10,
+        ge=1,
+        le=50,
+        description="Cantidad máxima de partidos",
+    )
+):
+    matches = await supabase_get(
+        "matches",
+        {
+            "select": (
+                "id,status,home_goals,away_goals,"
+                "starting_at,home_team_id,away_team_id"
+            ),
+            "status": "in.(FT,AET,PEN)",
+            "order": "starting_at.desc",
+            "limit": str(limit),
+        },
+    )
+
+    selected = len(matches)
+    predicted = 0
+    skipped = 0
+    failed = 0
+    details = []
+
+    for match in matches:
+        match_id = match.get("id")
+
+        if match_id is None:
+            continue
+
+        match_id = int(match_id)
+
+        try:
+            existing = await supabase_get(
+                "predictions",
+                {
+                    "select": "id",
+                    "match_id": f"eq.{match_id}",
+                    "market": "eq.1X2",
+                    "limit": "1",
+                },
+            )
+
+            if existing:
+                skipped += 1
+
+                details.append(
+                    {
+                        "match_id": match_id,
+                        "ok": True,
+                        "status": "skipped",
+                        "reason": (
+                            "Ya existen predicciones 1X2"
+                        ),
+                    }
+                )
+
+                continue
+
+            result = await predict_match(match_id)
+
+            predicted += 1
+
+            details.append(
+                {
+                    "match_id": match_id,
+                    "ok": True,
+                    "status": "predicted",
+                    "prediction": result.get(
+                        "prediction"
+                    ),
+                    "prediction_percentage": result.get(
+                        "prediction_percentage"
+                    ),
+                    "model_version": result.get(
+                        "model_version"
+                    ),
+                }
+            )
+
+        except Exception as exc:
+            failed += 1
+
+            details.append(
+                {
+                    "match_id": match_id,
+                    "ok": False,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+
+    return {
+        "ok": True,
+        "selected": selected,
+        "predicted": predicted,
+        "skipped": skipped,
+        "failed": failed,
+        "details": details,
+    }
+
+
+# ============================================================
+# EVALUAR VARIOS PARTIDOS
+# ============================================================
+
+async def evaluate_match_internal(
+    match_id: int,
+) -> dict[str, Any]:
 
     matches = await supabase_get(
         "matches",
@@ -127,34 +246,39 @@ async def evaluate_match_internal(match_id: int):
     if not matches:
         raise HTTPException(
             status_code=404,
-            detail=f"No existe el partido {match_id} en Supabase",
+            detail=(
+                f"No existe el partido {match_id} "
+                "en Supabase"
+            ),
         )
 
     match = matches[0]
 
-    status = str(match.get("status") or "").upper()
+    status = str(
+        match.get("status") or ""
+    ).upper()
 
     if status not in FINAL_STATUSES:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"El partido {match_id} todavía no está finalizado. "
-                f"Estado actual: {status}"
+                f"El partido {match_id} todavía "
+                f"no está finalizado. Estado: {status}"
             ),
         )
 
-    home_goals = match.get("home_goals")
-    away_goals = match.get("away_goals")
-
     actual_result = get_actual_result(
-        home_goals,
-        away_goals,
+        match.get("home_goals"),
+        match.get("away_goals"),
     )
 
     if actual_result is None:
         raise HTTPException(
             status_code=400,
-            detail=f"El partido {match_id} no tiene goles registrados",
+            detail=(
+                f"El partido {match_id} no tiene "
+                "marcador final."
+            ),
         )
 
     predictions = await supabase_get(
@@ -180,307 +304,333 @@ async def evaluate_match_internal(match_id: int):
         )
 
     prediction_ids = [
-        p["id"]
+        int(p["id"])
         for p in predictions
+        if p.get("id") is not None
     ]
 
-    existing_results = await supabase_get(
-        "prediction_results",
-        {
-            "select": "prediction_id",
-            "prediction_id": (
-                "in.("
-                + ",".join(str(x) for x in prediction_ids)
-                + ")"
-            ),
-        },
-    )
+    existing_results = []
 
-    existing_ids = {
-        row["prediction_id"]
-        for row in existing_results
+    if prediction_ids:
+        id_values = ",".join(
+            str(x) for x in prediction_ids
+        )
+
+        existing_results = await supabase_get(
+            "prediction_results",
+            {
+                "select": (
+                    "id,prediction_id,outcome,"
+                    "actual_value,evaluated_at"
+                ),
+                "prediction_id": f"in.({id_values})",
+            },
+        )
+
+    existing_by_prediction = {
+        int(r["prediction_id"]): r
+        for r in existing_results
+        if r.get("prediction_id") is not None
     }
 
-    new_results = []
-    timestamp = utc_now()
+    rows_to_insert = []
 
     for prediction in predictions:
+        prediction_id = prediction.get("id")
 
-        prediction_id = prediction["id"]
+        if prediction_id is None:
+            continue
 
-        if prediction_id in existing_ids:
+        prediction_id = int(prediction_id)
+
+        if prediction_id in existing_by_prediction:
             continue
 
         selection = str(
             prediction.get("selection") or ""
         ).upper()
 
-        correct = selection == actual_result
-
-        new_results.append(
+        rows_to_insert.append(
             {
                 "prediction_id": prediction_id,
-                "outcome": correct,
+                "outcome": (
+                    selection == actual_result
+                ),
                 "actual_value": actual_result,
-                "evaluated_at": timestamp,
             }
         )
 
-    inserted = []
+    inserted_rows = []
 
-    if new_results:
-        inserted = await supabase_post(
+    if rows_to_insert:
+        inserted_rows = await supabase_post(
             "prediction_results",
-            new_results,
+            rows_to_insert,
         )
 
-    evaluation = []
+    evaluations = []
 
     for prediction in predictions:
+        prediction_id = prediction.get("id")
+
+        if prediction_id is None:
+            continue
+
+        prediction_id = int(prediction_id)
 
         selection = str(
             prediction.get("selection") or ""
         ).upper()
 
-        probability = prediction.get("probability")
+        result_row = existing_by_prediction.get(
+            prediction_id
+        )
 
-        evaluation.append(
+        if result_row is None:
+            for inserted in inserted_rows:
+                if (
+                    int(
+                        inserted.get(
+                            "prediction_id",
+                            -1,
+                        )
+                    )
+                    == prediction_id
+                ):
+                    result_row = inserted
+                    break
+
+        evaluations.append(
             {
-                "prediction_id": prediction["id"],
+                "prediction_id": prediction_id,
+                "model_version": prediction.get(
+                    "model_version"
+                ),
                 "selection": selection,
-                "probability": probability,
-                "correct": selection == actual_result,
+                "probability": prediction.get(
+                    "probability"
+                ),
+                "correct": (
+                    selection == actual_result
+                ),
+                "actual_result": actual_result,
+                "result_id": (
+                    result_row.get("id")
+                    if result_row
+                    else None
+                ),
             }
         )
 
     correct_predictions = sum(
         1
-        for item in evaluation
+        for item in evaluations
         if item["correct"]
     )
 
     return {
+        "ok": True,
         "match_id": match_id,
         "status": status,
         "score": {
-            "home": home_goals,
-            "away": away_goals,
+            "home": match.get("home_goals"),
+            "away": match.get("away_goals"),
         },
         "actual_result": actual_result,
         "predictions_found": len(predictions),
-        "results_inserted": len(inserted),
-        "results_already_exist": (
-            len(predictions) - len(inserted)
+        "results_inserted": len(inserted_rows),
+        "results_already_exist": len(
+            existing_results
         ),
         "correct_predictions": correct_predictions,
-        "evaluation": evaluation,
+        "evaluations": evaluations,
+    }
+
+
+@router.get("/evaluate/batch")
+async def evaluate_batch(
+    limit: int = Query(
+        10,
+        ge=1,
+        le=50,
+        description="Cantidad máxima de partidos",
+    )
+):
+    matches = await supabase_get(
+        "matches",
+        {
+            "select": (
+                "id,status,home_goals,away_goals,"
+                "starting_at,home_team_id,away_team_id"
+            ),
+            "status": "in.(FT,AET,PEN)",
+            "order": "starting_at.desc",
+            "limit": str(limit),
+        },
+    )
+
+    selected = len(matches)
+    evaluated = 0
+    failed = 0
+    results_inserted = 0
+
+    details = []
+
+    for match in matches:
+        match_id = match.get("id")
+
+        if match_id is None:
+            continue
+
+        try:
+            result = await evaluate_match_internal(
+                int(match_id)
+            )
+
+            evaluated += 1
+
+            results_inserted += int(
+                result.get(
+                    "results_inserted",
+                    0,
+                )
+            )
+
+            details.append(
+                {
+                    "match_id": int(match_id),
+                    "ok": True,
+                    "actual_result": result.get(
+                        "actual_result"
+                    ),
+                    "predictions_found": result.get(
+                        "predictions_found",
+                        0,
+                    ),
+                    "results_inserted": result.get(
+                        "results_inserted",
+                        0,
+                    ),
+                    "results_already_exist": result.get(
+                        "results_already_exist",
+                        0,
+                    ),
+                    "correct_predictions": result.get(
+                        "correct_predictions",
+                        0,
+                    ),
+                }
+            )
+
+        except Exception as exc:
+            failed += 1
+
+            details.append(
+                {
+                    "match_id": int(match_id),
+                    "ok": False,
+                    "error": str(exc),
+                }
+            )
+
+    return {
+        "ok": True,
+        "selected": selected,
+        "evaluated": evaluated,
+        "failed": failed,
+        "results_inserted": results_inserted,
+        "details": details,
     }
 
 
 # ============================================================
-# EVALUACIÓN AUTOMÁTICA POR LOTES
-# IMPORTANTE:
-# ESTA RUTA VA ANTES DE /evaluate/{match_id}
-# ============================================================
-
-@router.get("/evaluate/batch")
-async def evaluate_batch(limit: int = 10):
-
-    if limit < 1 or limit > 50:
-        raise HTTPException(
-            status_code=400,
-            detail="El límite debe estar entre 1 y 50",
-        )
-
-    try:
-
-        matches = await supabase_get(
-            "matches",
-            {
-                "select": (
-                    "id,status,starting_at,"
-                    "home_goals,away_goals"
-                ),
-                "status": "in.(FT,AET,PEN)",
-                "order": "starting_at.desc",
-                "limit": str(limit),
-            },
-        )
-
-        if not matches:
-            return {
-                "ok": True,
-                "message": "No hay partidos finalizados",
-                "selected": 0,
-                "evaluated": 0,
-                "failed": 0,
-                "results_inserted": 0,
-                "details": {
-                    "evaluated": [],
-                    "failed": [],
-                },
-            }
-
-        evaluated = []
-        failed = []
-
-        for match in matches:
-
-            match_id = match.get("id")
-
-            if match_id is None:
-                continue
-
-            try:
-
-                result = await evaluate_match_internal(
-                    int(match_id)
-                )
-
-                evaluated.append(result)
-
-            except HTTPException as exc:
-
-                failed.append(
-                    {
-                        "match_id": match_id,
-                        "status_code": exc.status_code,
-                        "detail": exc.detail,
-                    }
-                )
-
-            except Exception as exc:
-
-                failed.append(
-                    {
-                        "match_id": match_id,
-                        "detail": str(exc),
-                    }
-                )
-
-        return {
-            "ok": True,
-            "selected": len(matches),
-            "evaluated": len(evaluated),
-            "failed": len(failed),
-            "results_inserted": sum(
-                item["results_inserted"]
-                for item in evaluated
-            ),
-            "details": {
-                "evaluated": evaluated,
-                "failed": failed,
-            },
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        )
-
-
-# ============================================================
 # EVALUAR UN SOLO PARTIDO
-# ESTA RUTA VA DESPUÉS DE /evaluate/batch
 # ============================================================
 
 @router.get("/evaluate/{match_id}")
 async def evaluate_match(match_id: int):
-
-    try:
-
-        result = await evaluate_match_internal(
-            match_id
-        )
-
-        return {
-            "ok": True,
-            **result,
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        )
+    return await evaluate_match_internal(
+        match_id
+    )
 
 
 # ============================================================
-# OBTENER RESULTADOS EVALUADOS
+# RESULTADOS DE PREDICCIONES
 # ============================================================
 
 async def get_all_prediction_results(
-    max_rows: int = 5000
-):
+    max_rows: int = 5000,
+) -> list[dict[str, Any]]:
+
+    all_rows = []
 
     page_size = 1000
     offset = 0
-    rows = []
 
-    while len(rows) < max_rows:
+    while len(all_rows) < max_rows:
+        remaining = max_rows - len(all_rows)
 
         current_limit = min(
             page_size,
-            max_rows - len(rows),
+            remaining,
         )
 
-        page = await supabase_get(
+        rows = await supabase_get(
             "prediction_results",
             {
                 "select": (
-                    "id,prediction_id,"
-                    "outcome,actual_value,evaluated_at"
+                    "id,prediction_id,outcome,"
+                    "actual_value,evaluated_at"
                 ),
                 "order": "id.asc",
-                "limit": str(current_limit),
                 "offset": str(offset),
+                "limit": str(current_limit),
             },
         )
 
-        if not page:
+        if not rows:
             break
 
-        rows.extend(page)
+        all_rows.extend(rows)
 
-        if len(page) < current_limit:
+        if len(rows) < current_limit:
             break
 
-        offset += len(page)
+        offset += len(rows)
 
-    return rows
+    return all_rows[:max_rows]
 
 
 async def get_predictions_by_ids(
-    prediction_ids: list[int]
-):
+    prediction_ids: list[int],
+) -> list[dict[str, Any]]:
 
     if not prediction_ids:
         return []
 
+    unique_ids = sorted(
+        {
+            int(x)
+            for x in prediction_ids
+        }
+    )
+
     all_predictions = []
+
     chunk_size = 200
 
     for start in range(
         0,
-        len(prediction_ids),
+        len(unique_ids),
         chunk_size,
     ):
-
-        chunk = prediction_ids[
+        chunk = unique_ids[
             start:start + chunk_size
         ]
 
-        filter_value = (
-            "in.("
-            + ",".join(str(x) for x in chunk)
-            + ")"
+        id_values = ",".join(
+            str(x)
+            for x in chunk
         )
 
         rows = await supabase_get(
@@ -491,8 +641,7 @@ async def get_predictions_by_ids(
                     "market,selection,probability,"
                     "predicted_at"
                 ),
-                "id": filter_value,
-                "limit": str(len(chunk)),
+                "id": f"in.({id_values})",
             },
         )
 
@@ -502,341 +651,411 @@ async def get_predictions_by_ids(
 
 
 # ============================================================
-# RENDIMIENTO DEL MODELO
+# RENDIMIENTO
 # ============================================================
 
 @router.get("/performance")
 async def ai_performance(
-    max_matches: int = 5000,
-    model_version: str | None = None,
+    max_matches: int = Query(
+        5000,
+        ge=1,
+        le=5000,
+    ),
+    model_version: Optional[str] = Query(
+        None,
+    ),
 ):
+    max_result_rows = max_matches * 3
 
-    if max_matches < 1 or max_matches > 5000:
-        raise HTTPException(
-            status_code=400,
-            detail="max_matches debe estar entre 1 y 5000",
-        )
+    results = await get_all_prediction_results(
+        max_rows=max_result_rows
+    )
 
-    try:
-
-        results = await get_all_prediction_results(
-            max_rows=max_matches * 3
-        )
-
-        if not results:
-            return {
-                "ok": True,
-                "message": (
-                    "Todavía no existen "
-                    "resultados evaluados"
-                ),
-                "evaluated_matches": 0,
-            }
-
-        prediction_ids = [
-            int(row["prediction_id"])
-            for row in results
-            if row.get("prediction_id") is not None
-        ]
-
-        predictions = await get_predictions_by_ids(
-            prediction_ids
-        )
-
-        predictions_by_id = {
-            int(p["id"]): p
-            for p in predictions
+    if not results:
+        return {
+            "ok": True,
+            "evaluated_matches": 0,
+            "correct_matches": 0,
+            "accuracy": None,
+            "accuracy_percent": None,
+            "log_loss": None,
+            "brier_score": None,
+            "models": [],
+            "message": (
+                "Todavía no existen resultados "
+                "evaluados."
+            ),
         }
 
-        match_predictions = defaultdict(list)
+    prediction_ids = [
+        int(row["prediction_id"])
+        for row in results
+        if row.get("prediction_id") is not None
+    ]
 
-        for result in results:
+    predictions = await get_predictions_by_ids(
+        prediction_ids
+    )
 
-            prediction_id = result.get(
-                "prediction_id"
-            )
+    prediction_map = {
+        int(p["id"]): p
+        for p in predictions
+        if p.get("id") is not None
+    }
 
-            if prediction_id is None:
+    grouped = defaultdict(list)
+
+    for result in results:
+        prediction_id = result.get(
+            "prediction_id"
+        )
+
+        if prediction_id is None:
+            continue
+
+        prediction = prediction_map.get(
+            int(prediction_id)
+        )
+
+        if not prediction:
+            continue
+
+        if str(
+            prediction.get("market") or ""
+        ).upper() != "1X2":
+            continue
+
+        if (
+            model_version is not None
+            and prediction.get("model_version")
+            != model_version
+        ):
+            continue
+
+        grouped[
+            int(prediction["match_id"])
+        ].append(
+            {
+                "result": result,
+                "prediction": prediction,
+            }
+        )
+
+    match_records = []
+
+    for match_id, rows in grouped.items():
+        valid_rows = []
+
+        for row in rows:
+            probability = row[
+                "prediction"
+            ].get("probability")
+
+            selection = str(
+                row["prediction"].get(
+                    "selection"
+                ) or ""
+            ).upper()
+
+            actual = str(
+                row["result"].get(
+                    "actual_value"
+                ) or ""
+            ).upper()
+
+            if probability is None:
                 continue
 
-            prediction = predictions_by_id.get(
-                int(prediction_id)
-            )
-
-            if not prediction:
-                continue
-
-            if str(
-                prediction.get("market") or ""
-            ).upper() != "1X2":
-                continue
-
-            current_model = str(
-                prediction.get("model_version") or ""
-            )
-
-            if (
-                model_version
-                and current_model != model_version
+            try:
+                probability = float(
+                    probability
+                )
+            except (
+                TypeError,
+                ValueError,
             ):
                 continue
 
-            match_id = prediction.get("match_id")
-
-            if match_id is None:
+            if not math.isfinite(
+                probability
+            ):
                 continue
 
-            match_predictions[
-                int(match_id)
-            ].append(
-                {
-                    "prediction": prediction,
-                    "result": result,
-                }
-            )
-
-        accuracy_total = 0
-        log_loss_total = 0.0
-        brier_total = 0.0
-        evaluated_matches = 0
-
-        by_model = defaultdict(
-            lambda: {
-                "matches": 0,
-                "correct": 0,
-                "log_loss": 0.0,
-                "brier_score": 0.0,
-            }
-        )
-
-        for match_id, rows in match_predictions.items():
-
-            probability_by_selection = {}
-            actual_result = None
-            selected_prediction = None
-
-            for row in rows:
-
-                prediction = row["prediction"]
-                result = row["result"]
-
-                selection = str(
-                    prediction.get("selection") or ""
-                ).upper()
-
-                probability = prediction.get(
-                    "probability"
-                )
-
-                if probability is None:
-                    continue
-
-                try:
-                    probability = float(probability)
-                except Exception:
-                    continue
-
-                probability = max(
-                    0.0,
-                    min(1.0, probability),
-                )
-
-                probability_by_selection[
-                    selection
-                ] = probability
-
-                actual_result = str(
-                    result.get("actual_value") or ""
-                ).upper()
-
-                if (
-                    selected_prediction is None
-                    or probability
-                    > float(
-                        selected_prediction["probability"]
-                    )
-                ):
-                    selected_prediction = {
-                        "selection": selection,
-                        "probability": probability,
-                        "model_version": (
-                            prediction.get(
-                                "model_version"
-                            )
-                        ),
-                    }
-
-            if actual_result not in {
+            if selection not in {
                 "HOME",
                 "DRAW",
                 "AWAY",
             }:
                 continue
 
-            if not probability_by_selection:
-                continue
-
-            evaluated_matches += 1
-
-            predicted_result = (
-                selected_prediction["selection"]
-                if selected_prediction
-                else None
-            )
-
-            correct = (
-                predicted_result == actual_result
-            )
-
-            if correct:
-                accuracy_total += 1
-
-            actual_probability = (
-                probability_by_selection.get(
-                    actual_result,
-                    0.0,
-                )
-            )
-
-            epsilon = 1e-15
-
-            actual_probability = max(
-                epsilon,
-                min(
-                    1.0 - epsilon,
-                    actual_probability,
-                ),
-            )
-
-            match_log_loss = -math.log(
-                actual_probability
-            )
-
-            log_loss_total += match_log_loss
-
-            match_brier = 0.0
-
-            for selection in (
+            if actual not in {
                 "HOME",
                 "DRAW",
                 "AWAY",
-            ):
+            }:
+                continue
 
-                probability = (
-                    probability_by_selection.get(
-                        selection,
-                        0.0,
-                    )
-                )
-
-                expected = (
-                    1.0
-                    if selection == actual_result
-                    else 0.0
-                )
-
-                match_brier += (
-                    probability - expected
-                ) ** 2
-
-            brier_total += match_brier
-
-            model_name = str(
-                selected_prediction.get(
-                    "model_version"
-                )
-                or "unknown"
+            valid_rows.append(
+                {
+                    "selection": selection,
+                    "probability": probability,
+                    "actual": actual,
+                    "model_version": row[
+                        "prediction"
+                    ].get(
+                        "model_version"
+                    ),
+                }
             )
 
-            by_model[model_name]["matches"] += 1
+        if not valid_rows:
+            continue
 
-            if correct:
-                by_model[model_name]["correct"] += 1
+        best = max(
+            valid_rows,
+            key=lambda x: x["probability"],
+        )
 
-            by_model[model_name]["log_loss"] += (
-                match_log_loss
-            )
+        match_records.append(best)
 
-            by_model[model_name]["brier_score"] += (
-                match_brier
-            )
-
-        if evaluated_matches == 0:
-            return {
-                "ok": True,
-                "message": (
-                    "No hay suficientes "
-                    "predicciones 1X2 evaluadas"
-                ),
-                "evaluated_matches": 0,
-            }
-
-        model_summary = {}
-
-        for name, data in by_model.items():
-
-            matches = data["matches"]
-
-            model_summary[name] = {
-                "matches": matches,
-                "accuracy": round(
-                    data["correct"] / matches,
-                    6,
-                ),
-                "accuracy_percent": round(
-                    (
-                        data["correct"]
-                        / matches
-                    ) * 100,
-                    2,
-                ),
-                "log_loss": round(
-                    data["log_loss"] / matches,
-                    6,
-                ),
-                "brier_score": round(
-                    data["brier_score"] / matches,
-                    6,
-                ),
-            }
-
+    if not match_records:
         return {
             "ok": True,
-            "market": "1X2",
-            "model_version": (
-                model_version
-                if model_version
-                else "ALL"
+            "evaluated_matches": 0,
+            "correct_matches": 0,
+            "accuracy": None,
+            "accuracy_percent": None,
+            "log_loss": None,
+            "brier_score": None,
+            "models": [],
+            "message": (
+                "No hay predicciones 1X2 "
+                "válidas para analizar."
             ),
-            "evaluated_matches": evaluated_matches,
-            "correct_matches": accuracy_total,
-            "accuracy": round(
-                accuracy_total / evaluated_matches,
-                6,
-            ),
-            "accuracy_percent": round(
-                (
-                    accuracy_total
-                    / evaluated_matches
-                ) * 100,
-                2,
-            ),
-            "log_loss": round(
-                log_loss_total / evaluated_matches,
-                6,
-            ),
-            "brier_score": round(
-                brier_total / evaluated_matches,
-                6,
-            ),
-            "models": model_summary,
         }
 
-    except HTTPException:
-        raise
+    evaluated_matches = len(
+        match_records
+    )
 
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
+    correct_matches = sum(
+        1
+        for record in match_records
+        if record["selection"]
+        == record["actual"]
+    )
+
+    accuracy = (
+        correct_matches
+        / evaluated_matches
+    )
+
+    log_loss_values = []
+
+    for record in match_records:
+        probability = max(
+            1e-15,
+            min(
+                1.0 - 1e-15,
+                float(
+                    record["probability"]
+                ),
+            ),
         )
+
+        if (
+            record["selection"]
+            == record["actual"]
+        ):
+            value = probability
+        else:
+            value = max(
+                1e-15,
+                (1.0 - probability)
+                / 2.0,
+            )
+
+        log_loss_values.append(
+            -math.log(value)
+        )
+
+    log_loss = (
+        sum(log_loss_values)
+        / len(log_loss_values)
+    )
+
+    # Brier Score
+    brier_values = []
+
+    grouped_brier = defaultdict(list)
+
+    for match_id, rows in grouped.items():
+        for row in rows:
+            prediction = row[
+                "prediction"
+            ]
+
+            probability = prediction.get(
+                "probability"
+            )
+
+            if probability is None:
+                continue
+
+            try:
+                probability = float(
+                    probability
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            selection = str(
+                prediction.get(
+                    "selection"
+                ) or ""
+            ).upper()
+
+            actual = str(
+                row["result"].get(
+                    "actual_value"
+                ) or ""
+            ).upper()
+
+            if selection not in {
+                "HOME",
+                "DRAW",
+                "AWAY",
+            }:
+                continue
+
+            if actual not in {
+                "HOME",
+                "DRAW",
+                "AWAY",
+            }:
+                continue
+
+            grouped_brier[match_id].append(
+                {
+                    "selection": selection,
+                    "probability": probability,
+                    "actual": actual,
+                }
+            )
+
+    for match_id, rows in grouped_brier.items():
+        probabilities = {
+            "HOME": 0.0,
+            "DRAW": 0.0,
+            "AWAY": 0.0,
+        }
+
+        actual = None
+
+        for row in rows:
+            probabilities[
+                row["selection"]
+            ] = max(
+                0.0,
+                min(
+                    1.0,
+                    row["probability"],
+                ),
+            )
+
+            actual = row["actual"]
+
+        if actual is None:
+            continue
+
+        score = 0.0
+
+        for selection in (
+            "HOME",
+            "DRAW",
+            "AWAY",
+        ):
+            target = (
+                1.0
+                if selection == actual
+                else 0.0
+            )
+
+            score += (
+                probabilities[
+                    selection
+                ] - target
+            ) ** 2
+
+        brier_values.append(score)
+
+    brier_score = (
+        sum(brier_values)
+        / len(brier_values)
+        if brier_values
+        else None
+    )
+
+    # Resumen por modelo
+    models_grouped = defaultdict(list)
+
+    for record in match_records:
+        models_grouped[
+            record["model_version"]
+            or "unknown"
+        ].append(record)
+
+    models_summary = []
+
+    for version, records in (
+        models_grouped.items()
+    ):
+        total = len(records)
+
+        correct = sum(
+            1
+            for record in records
+            if record["selection"]
+            == record["actual"]
+        )
+
+        model_accuracy = (
+            correct / total
+            if total
+            else None
+        )
+
+        models_summary.append(
+            {
+                "model_version": version,
+                "evaluated_matches": total,
+                "correct_matches": correct,
+                "accuracy": model_accuracy,
+                "accuracy_percent": (
+                    round(
+                        model_accuracy * 100,
+                        2,
+                    )
+                    if model_accuracy
+                    is not None
+                    else None
+                ),
+            }
+        )
+
+    return {
+        "ok": True,
+        "evaluated_matches": evaluated_matches,
+        "correct_matches": correct_matches,
+        "accuracy": accuracy,
+        "accuracy_percent": round(
+            accuracy * 100,
+            2,
+        ),
+        "log_loss": log_loss,
+        "brier_score": brier_score,
+        "models": models_summary,
+    }
