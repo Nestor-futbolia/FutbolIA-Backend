@@ -1,0 +1,82 @@
+name: Sincronizar La Liga 2024
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Iniciar backend
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+        run: |
+          echo "=== INICIANDO BACKEND ==="
+
+          python -m uvicorn app.main:app \
+            --host 127.0.0.1 \
+            --port 8000 > server.log 2>&1 &
+
+          SERVER_PID=$!
+
+          echo "PID: $SERVER_PID"
+
+          sleep 5
+
+          echo "=== LOG DEL BACKEND ==="
+          cat server.log
+
+          echo "=== COMPROBANDO HEALTH ==="
+          curl -f http://127.0.0.1:8000/health
+
+          echo ""
+          echo "=== SINCRONIZANDO LA LIGA ESPAÑOLA ==="
+          echo "Liga: 140"
+          echo "Temporada: 2024"
+
+          HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" \
+            "http://127.0.0.1:8000/sync/fixtures?league=140&season=2024")
+
+          echo ""
+          echo "=== CÓDIGO HTTP ==="
+          echo "$HTTP_CODE"
+
+          echo ""
+          echo "=== RESPUESTA DEL BACKEND ==="
+          cat response.json
+
+          echo ""
+          echo "=== RESULTADO ==="
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "========================================"
+            echo "SINCRONIZACION EXITOSA"
+            echo "========================================"
+            echo "API-FOOTBALL"
+            echo "     ↓"
+            echo "BACKEND"
+            echo "     ↓"
+            echo "SUPABASE"
+            echo "========================================"
+          else
+            echo "========================================"
+            echo "ERROR EN LA SINCRONIZACION"
+            echo "========================================"
+            exit 1
+          fi
+
+          kill $SERVER_PID || true
