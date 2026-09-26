@@ -49,7 +49,7 @@ jobs:
           echo "=== SINCRONIZANDO LA LIGA ESPAÑOLA ==="
 
           HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" \
-            "http://127.0.0.1:8000/sync/league?league=140&season=2025")
+            "http://127.0.0.1:8000/sync/league?league=140&season=2024")
 
           echo "Código HTTP: $HTTP_CODE"
 
