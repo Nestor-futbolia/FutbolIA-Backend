@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 
 app = FastAPI(
     title="Fútbol IA 2.0 API",
-    version="0.3.0"
+    version="0.4.0"
 )
 
 BASE_URL = "https://v3.football.api-sports.io"
@@ -34,7 +34,7 @@ async def football_get(
         "Accept": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         response = await client.get(
             BASE_URL + path,
             params=params or {},
@@ -44,7 +44,7 @@ async def football_get(
     if response.status_code >= 400:
         raise HTTPException(
             status_code=response.status_code,
-            detail=response.text[:1000]
+            detail=response.text[:2000]
         )
 
     data = response.json()
@@ -78,6 +78,30 @@ def get_supabase_headers(supabase_key: str):
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates",
     }
+
+
+async def supabase_upsert(
+    table: str,
+    rows,
+    supabase_url: str,
+    supabase_key: str
+):
+    headers = get_supabase_headers(supabase_key)
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            f"{supabase_url}/rest/v1/{table}",
+            headers=headers,
+            json=rows
+        )
+
+    if response.status_code >= 300:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error Supabase en {table}: {response.text[:3000]}"
+        )
+
+    return response
 
 
 @app.get("/")
@@ -265,25 +289,110 @@ async def sync_league(
     }
 
     supabase_url, supabase_key = get_supabase_config()
-    headers = get_supabase_headers(supabase_key)
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            f"{supabase_url}/rest/v1/leagues",
-            headers=headers,
-            json=row
-        )
+    await supabase_upsert(
+        "leagues",
+        row,
+        supabase_url,
+        supabase_key
+    )
 
-    if response.status_code >= 300:
-        raise HTTPException(
-            status_code=502,
-            detail=response.text[:1000]
+    season_info = item.get("seasons", [])
+
+    season_rows = []
+
+    for season_item in season_info:
+        season_id = season_item.get("year")
+
+        if season_id is None:
+            continue
+
+        season_rows.append({
+            "id": season_id,
+            "league_id": league_info["id"],
+            "name": str(season_item.get("year")),
+            "starting_at": season_item.get("start"),
+            "ending_at": season_item.get("end")
+        })
+
+    if season_rows:
+        await supabase_upsert(
+            "seasons",
+            season_rows,
+            supabase_url,
+            supabase_key
         )
 
     return {
         "ok": True,
-        "message": "Liga sincronizada correctamente",
-        "league": row
+        "message": "Liga y temporadas sincronizadas correctamente",
+        "league": row,
+        "seasons_saved": len(season_rows)
+    }
+
+
+@app.get("/sync/teams")
+async def sync_teams(
+    league: int,
+    season: int
+):
+    data = await football_get(
+        "/teams",
+        {
+            "league": league,
+            "season": season
+        }
+    )
+
+    teams_data = data.get("response", [])
+
+    if not teams_data:
+        raise HTTPException(
+            status_code=404,
+            detail="No se encontraron equipos"
+        )
+
+    supabase_url, supabase_key = get_supabase_config()
+
+    rows = []
+
+    for item in teams_data:
+        team_info = item.get("team", {})
+        venue_info = item.get("venue", {})
+
+        team_id = team_info.get("id")
+
+        if team_id is None:
+            continue
+
+        rows.append({
+            "id": team_id,
+            "name": team_info.get("name"),
+            "short_code": team_info.get("code"),
+            "country": team_info.get("country"),
+            "venue_name": venue_info.get("name"),
+            "league_id": league
+        })
+
+    if not rows:
+        raise HTTPException(
+            status_code=502,
+            detail="API-Football no devolvió equipos válidos"
+        )
+
+    await supabase_upsert(
+        "teams",
+        rows,
+        supabase_url,
+        supabase_key
+    )
+
+    return {
+        "ok": True,
+        "message": "Equipos sincronizados correctamente",
+        "league": league,
+        "season": season,
+        "teams_saved": len(rows)
     }
 
 
@@ -292,6 +401,19 @@ async def sync_fixtures(
     league: int,
     season: int
 ):
+    # 1. Sincronizar liga y temporada
+    await sync_league(
+        league=league,
+        season=season
+    )
+
+    # 2. Sincronizar equipos
+    await sync_teams(
+        league=league,
+        season=season
+    )
+
+    # 3. Obtener partidos
     data = await football_get(
         "/fixtures",
         {
@@ -309,7 +431,6 @@ async def sync_fixtures(
         )
 
     supabase_url, supabase_key = get_supabase_config()
-    headers = get_supabase_headers(supabase_key)
 
     rows = []
 
@@ -324,24 +445,24 @@ async def sync_fixtures(
         home_team = teams_info.get("home", {})
         away_team = teams_info.get("away", {})
 
-        starting_at = fixture_info.get("date")
+        fixture_id = fixture_info.get("id")
 
-        row = {
-            "id": fixture_info.get("id"),
+        if fixture_id is None:
+            continue
+
+        rows.append({
+            "id": fixture_id,
             "league_id": league_info.get("id"),
             "season_id": league_info.get("season"),
             "home_team_id": home_team.get("id"),
             "away_team_id": away_team.get("id"),
-            "starting_at": starting_at,
+            "starting_at": fixture_info.get("date"),
             "status": fixture_info.get("status", {}).get("short"),
             "home_goals": goals_info.get("home"),
             "away_goals": goals_info.get("away"),
             "home_ht_goals": halftime_info.get("home"),
             "away_ht_goals": halftime_info.get("away")
-        }
-
-        if row["id"] is not None:
-            rows.append(row)
+        })
 
     if not rows:
         raise HTTPException(
@@ -349,22 +470,16 @@ async def sync_fixtures(
             detail="API-Football devolvió partidos sin identificadores válidos"
         )
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(
-            f"{supabase_url}/rest/v1/matches",
-            headers=headers,
-            json=rows
-        )
-
-    if response.status_code >= 300:
-        raise HTTPException(
-            status_code=502,
-            detail=response.text[:2000]
-        )
+    await supabase_upsert(
+        "matches",
+        rows,
+        supabase_url,
+        supabase_key
+    )
 
     return {
         "ok": True,
-        "message": "Partidos sincronizados correctamente",
+        "message": "Liga, temporada, equipos y partidos sincronizados correctamente",
         "league": league,
         "season": season,
         "matches_received": len(fixtures_data),
