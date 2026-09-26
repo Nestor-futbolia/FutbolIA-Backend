@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 
 app = FastAPI(
     title="Fútbol IA 2.0 API",
-    version="0.5.0"
+    version="0.6.0"
 )
 
 BASE_URL = "https://v3.football.api-sports.io"
@@ -102,6 +102,42 @@ async def supabase_upsert(
         )
 
     return response
+
+
+async def get_saved_statistic_fixture_ids(
+    supabase_url: str,
+    supabase_key: str
+):
+    headers = get_supabase_headers(supabase_key)
+
+    params = {
+        "select": "match_id",
+        "limit": "10000"
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.get(
+            f"{supabase_url}/rest/v1/match_statistics",
+            headers=headers,
+            params=params
+        )
+
+    if response.status_code >= 300:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "No se pudieron consultar las estadísticas existentes: "
+                + response.text[:3000]
+            )
+        )
+
+    data = response.json()
+
+    return {
+        row.get("match_id")
+        for row in data
+        if row.get("match_id") is not None
+    }
 
 
 @app.get("/")
@@ -488,15 +524,6 @@ async def sync_fixtures(
 async def sync_statistics(
     fixture: int
 ):
-    """
-    Sincroniza las estadísticas de un partido concreto.
-
-    Importante:
-    API-Football cobra una solicitud por consulta.
-    Por eso esta ruta trabaja con un solo fixture
-    para poder controlar el límite gratuito.
-    """
-
     data = await football_get(
         "/fixtures/statistics",
         {
@@ -537,6 +564,7 @@ async def sync_statistics(
 
             if isinstance(value, (int, float)):
                 value_numeric = float(value)
+
             elif isinstance(value, str):
                 cleaned = value.replace("%", "").strip()
 
@@ -544,6 +572,7 @@ async def sync_statistics(
                     value_numeric = float(cleaned)
                 except ValueError:
                     value_text = value
+
             elif value is not None:
                 value_text = str(value)
 
@@ -561,80 +590,4 @@ async def sync_statistics(
             detail="El partido no devolvió estadísticas utilizables"
         )
 
-    await supabase_upsert(
-        "match_statistics",
-        rows,
-        supabase_url,
-        supabase_key
-    )
-
-    return {
-        "ok": True,
-        "message": "Estadísticas sincronizadas correctamente",
-        "fixture": fixture,
-        "statistics_saved": len(rows)
-    }
-
-
-@app.get("/sync/statistics/sample")
-async def sync_statistics_sample(
-    league: int,
-    season: int
-):
-    """
-    Busca un partido terminado de la competición y sincroniza
-    sus estadísticas.
-
-    Consume normalmente:
-    1 solicitud para fixtures
-    1 solicitud para statistics
-    """
-
-    data = await football_get(
-        "/fixtures",
-        {
-            "league": league,
-            "season": season
-        }
-    )
-
-    fixtures_data = data.get("response", [])
-
-    if not fixtures_data:
-        raise HTTPException(
-            status_code=404,
-            detail="No se encontraron partidos"
-        )
-
-    selected_fixture = None
-
-    for item in fixtures_data:
-        fixture_info = item.get("fixture", {})
-        status = fixture_info.get("status", {}).get("short")
-
-        if status in {
-            "FT",
-            "AET",
-            "PEN"
-        }:
-            selected_fixture = fixture_info.get("id")
-            break
-
-    if selected_fixture is None:
-        raise HTTPException(
-            status_code=404,
-            detail="No se encontró un partido terminado"
-        )
-
-    result = await sync_statistics(
-        fixture=selected_fixture
-    )
-
-    return {
-        "ok": True,
-        "message": "Partido de prueba sincronizado correctamente",
-        "league": league,
-        "season": season,
-        "fixture": selected_fixture,
-        "statistics_saved": result["statistics_saved"]
-    }
+   
