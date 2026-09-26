@@ -73,7 +73,6 @@ def supabase_get(table: str, params: dict):
         )
 
     if response.status_code not in (200, 206):
-
         raise RuntimeError(
             f"Supabase GET {table} "
             f"HTTP {response.status_code}: "
@@ -249,9 +248,13 @@ def team_form(history):
     if len(history) < WINDOW:
         return None
 
+    # IMPORTANTE:
+    # history es un deque.
+    # deque no permite slicing directamente.
+    # Primero lo convertimos a lista.
     recent = list(
-        history[-WINDOW:]
-    )
+        history
+    )[-WINDOW:]
 
     goals_for = sum(
         item["gf"]
@@ -309,25 +312,33 @@ def build_dataset(matches):
 
         # Necesitamos suficiente historial
         # ANTES del partido.
+
         if (
             home_form is None
             or away_form is None
         ):
+
             skipped += 1
 
             # Después de evaluar la falta
             # de historial, incorporamos
             # el partido a la historia.
+
             home_goals = match["home_goals"]
             away_goals = match["away_goals"]
 
             if home_goals > away_goals:
+
                 home_points = 3
                 away_points = 0
+
             elif home_goals == away_goals:
+
                 home_points = 1
                 away_points = 1
+
             else:
+
                 home_points = 0
                 away_points = 3
 
@@ -346,12 +357,19 @@ def build_dataset(matches):
             continue
 
         feature_vector = [
+
             home_form["goals_for"],
+
             home_form["goals_against"],
+
             home_form["points"],
+
             away_form["goals_for"],
+
             away_form["goals_against"],
+
             away_form["points"],
+
             (
                 home_form["goals_for"]
                 - home_form["goals_against"]
@@ -361,10 +379,12 @@ def build_dataset(matches):
                 away_form["goals_for"]
                 - away_form["goals_against"]
             ),
+
             (
                 home_form["points"]
                 - away_form["points"]
             ),
+
             1.0,
         ]
 
@@ -372,29 +392,42 @@ def build_dataset(matches):
         away_goals = match["away_goals"]
 
         if home_goals > away_goals:
+
             target = "H"
+
         elif home_goals == away_goals:
+
             target = "D"
+
         else:
+
             target = "A"
 
         X.append(feature_vector)
+
         y.append(target)
-        match_ids.append(match["id"])
+
+        match_ids.append(
+            match["id"]
+        )
 
         # IMPORTANTE:
         # El resultado se agrega al historial
         # solamente DESPUES de construir
         # las variables del partido.
+
         if home_goals > away_goals:
+
             home_points = 3
             away_points = 0
 
         elif home_goals == away_goals:
+
             home_points = 1
             away_points = 1
 
         else:
+
             home_points = 0
             away_points = 3
 
@@ -449,11 +482,13 @@ def train_model(X, y):
     # División temporal:
     # primeros 80% entrenamiento
     # últimos 20% validación.
+
     split = int(
         len(X) * 0.80
     )
 
     if split < 20:
+
         raise RuntimeError(
             "El conjunto de entrenamiento "
             "es demasiado pequeño."
@@ -511,16 +546,23 @@ def train_model(X, y):
     )
 
     print("")
-    print("=== VALIDACION DEL MODELO ===")
+
+    print(
+        "=== VALIDACION DEL MODELO ==="
+    )
+
     print(
         f"Entrenamiento: {len(X_train)}"
     )
+
     print(
         f"Validacion: {len(X_valid)}"
     )
+
     print(
         f"Accuracy: {accuracy:.4f}"
     )
+
     print(
         f"Log loss: {logloss:.4f}"
     )
@@ -549,9 +591,12 @@ def serialize_model(
 ):
 
     model_blob = {
-        "model_type": "multinomial_logistic_regression",
 
-        "feature_names": FEATURE_NAMES,
+        "model_type":
+            "multinomial_logistic_regression",
+
+        "feature_names":
+            FEATURE_NAMES,
 
         "classes": [
             str(item)
@@ -559,41 +604,46 @@ def serialize_model(
         ],
 
         "coefficients": [
+
             [
                 float(value)
                 for value in row
             ]
+
             for row in model.coef_
         ],
 
         "intercept": [
+
             float(value)
             for value in model.intercept_
         ],
 
         "scaler_mean": [
+
             float(value)
             for value in scaler.mean_
         ],
 
         "scaler_scale": [
+
             float(value)
             for value in scaler.scale_
         ],
 
         "metrics": {
-            "validation_accuracy": float(
-                accuracy
-            ),
-            "validation_log_loss": float(
-                logloss
-            ),
-            "training_matches": int(
-                training_matches
-            ),
-            "validation_matches": int(
-                validation_matches
-            ),
+
+            "validation_accuracy":
+                float(accuracy),
+
+            "validation_log_loss":
+                float(logloss),
+
+            "training_matches":
+                int(training_matches),
+
+            "validation_matches":
+                int(validation_matches),
         },
     }
 
@@ -617,7 +667,9 @@ def get_active_model():
                 "metrics,"
                 "active"
             ),
+
             "active": "eq.true",
+
             "limit": "1",
         },
     )
@@ -649,8 +701,11 @@ def active_log_loss(active):
     )
 
     try:
+
         return float(value)
+
     except Exception:
+
         return None
 
 
@@ -688,9 +743,13 @@ def save_model(
     # Los siguientes solamente se activan
     # automáticamente si su log loss
     # es igual o mejor que el modelo activo.
+
     if previous_logloss is None:
+
         should_activate = True
+
     else:
+
         should_activate = (
             logloss <= previous_logloss
         )
@@ -708,28 +767,36 @@ def save_model(
         )
 
     row = {
+
         "version": version,
+
         "model_name": (
             "FutbolIA-1X2-"
             "LogisticRegression"
         ),
-        "trained_at": now.isoformat(),
-        "training_matches": (
-            training_matches
-        ),
+
+        "trained_at":
+            now.isoformat(),
+
+        "training_matches":
+            training_matches,
+
         "metrics": {
+
             **model_blob,
-            "validation_accuracy": (
-                float(accuracy)
-            ),
-            "validation_log_loss": (
-                float(logloss)
-            ),
-            "previous_active_log_loss": (
-                previous_logloss
-            ),
+
+            "validation_accuracy":
+                float(accuracy),
+
+            "validation_log_loss":
+                float(logloss),
+
+            "previous_active_log_loss":
+                previous_logloss,
         },
-        "active": should_activate,
+
+        "active":
+            should_activate,
     }
 
     supabase_post(
@@ -738,7 +805,11 @@ def save_model(
     )
 
     print("")
-    print("=== MODELO GUARDADO ===")
+
+    print(
+        "=== MODELO GUARDADO ==="
+    )
+
     print(
         f"Version: {version}"
     )
@@ -762,13 +833,27 @@ def save_model(
     )
 
     return {
-        "version": version,
-        "active": should_activate,
-        "accuracy": accuracy,
-        "log_loss": logloss,
-        "previous_log_loss": previous_logloss,
-        "training_matches": training_matches,
-        "validation_matches": validation_matches,
+
+        "version":
+            version,
+
+        "active":
+            should_activate,
+
+        "accuracy":
+            accuracy,
+
+        "log_loss":
+            logloss,
+
+        "previous_log_loss":
+            previous_logloss,
+
+        "training_matches":
+            training_matches,
+
+        "validation_matches":
+            validation_matches,
     }
 
 
@@ -779,9 +864,19 @@ def save_model(
 def main():
 
     print("")
-    print("========================================")
-    print("FUTBOL IA - ENTRENAMIENTO REAL")
-    print("========================================")
+
+    print(
+        "========================================"
+    )
+
+    print(
+        "FUTBOL IA - ENTRENAMIENTO REAL"
+    )
+
+    print(
+        "========================================"
+    )
+
     print("")
 
     matches_raw = load_matches()
@@ -835,9 +930,19 @@ def main():
     )
 
     print("")
-    print("========================================")
-    print("ENTRENAMIENTO FINALIZADO")
-    print("========================================")
+
+    print(
+        "========================================"
+    )
+
+    print(
+        "ENTRENAMIENTO FINALIZADO"
+    )
+
+    print(
+        "========================================"
+    )
+
     print(
         json.dumps(
             result,
@@ -845,7 +950,10 @@ def main():
             ensure_ascii=False,
         )
     )
-    print("========================================")
+
+    print(
+        "========================================"
+    )
 
 
 if __name__ == "__main__":
