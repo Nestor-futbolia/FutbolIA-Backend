@@ -26,23 +26,16 @@ SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "").strip()
 MODEL_NAME = "NESTOR-1X2-LogisticRegression"
 MODEL_FAMILY = "1X2"
 
-# Protocolo común de evaluación.
-MODEL_PROTOCOL_VERSION = "NESTOR-EVAL-v1.1"
+MODEL_PROTOCOL_VERSION = "NESTOR-EVAL-v1.2"
 
 MIN_MATCHES = 80
 WINDOW = 5
 PAGE_SIZE = 1000
 
-# Calibración por temperature scaling.
 CALIBRATION_GRID = np.linspace(0.50, 3.00, 101)
 
-# Un challenger debe mejorar el log loss por más de este margen.
 ACTIVATION_MARGIN = 0.001
 
-# División temporal:
-# 60% entrenamiento
-# 20% calibración
-# 20% holdout común
 TRAIN_RATIO = 0.60
 CALIBRATION_RATIO = 0.20
 
@@ -308,26 +301,6 @@ def fit_temperature(
     return best_t
 
 
-def model_probabilities(
-    model: LogisticRegression,
-    scaler: StandardScaler,
-    X: np.ndarray,
-    temperature: float,
-) -> np.ndarray:
-
-    Xs = scaler.transform(X)
-
-    logits = (
-        Xs @ model.coef_.T
-        + model.intercept_
-    )
-
-    return softmax(
-        logits,
-        temperature,
-    )
-
-
 def feature_defaults(
     X_train: np.ndarray,
 ) -> dict[str, float]:
@@ -359,7 +332,7 @@ def serialize_artifact(
 ) -> dict[str, Any]:
 
     return {
-        "format_version": "NESTOR-MODEL-v1.1",
+        "format_version": "NESTOR-MODEL-v1.2",
 
         "model_type": "logistic_regression",
 
@@ -435,65 +408,40 @@ def serialize_artifact(
     }
 
 
-def validate_artifact_compatibility(
+def convert_legacy_artifact(
     artifact: dict[str, Any] | None,
-) -> tuple[bool, str]:
+) -> tuple[dict[str, Any] | None, str]:
 
     if not isinstance(
         artifact,
         dict,
     ):
-        return (
-            False,
-            "artifact_missing",
-        )
+        return None, "artifact_missing"
 
-    if artifact.get(
+    model_type = artifact.get(
         "model_type"
-    ) != "logistic_regression":
-
-        return (
-            False,
-            "model_type_incompatible",
-        )
-
-    features = artifact.get(
-        "features"
     )
 
-    if features != FEATURE_NAMES:
-
-        return (
-            False,
-            "feature_names_incompatible",
-        )
+    if model_type != "multinomial_logistic_regression":
+        return None, "unsupported_legacy_model_type"
 
     classes = artifact.get(
         "classes"
     )
 
-    if classes is not None:
-        try:
-            normalized_classes = [
-                int(value)
-                for value in classes
-            ]
-        except Exception:
-            return (
-                False,
-                "classes_invalid",
-            )
+    if classes != [
+        "A",
+        "D",
+        "H",
+    ]:
+        return None, "legacy_class_order_incompatible"
 
-        if normalized_classes != [
-            0,
-            1,
-            2,
-        ]:
+    feature_names = artifact.get(
+        "feature_names"
+    )
 
-            return (
-                False,
-                "classes_incompatible",
-            )
+    if feature_names != FEATURE_NAMES:
+        return None, "legacy_features_incompatible"
 
     try:
 
@@ -519,10 +467,7 @@ def validate_artifact_compatibility(
 
     except Exception:
 
-        return (
-            False,
-            "artifact_arrays_invalid",
-        )
+        return None, "legacy_parameters_invalid"
 
     expected_features = len(
         FEATURE_NAMES
@@ -532,67 +477,187 @@ def validate_artifact_compatibility(
         3,
         expected_features,
     ):
-
-        return (
-            False,
-            "coefficient_shape_incompatible",
-        )
+        return None, "legacy_coefficient_shape_invalid"
 
     if intercept.shape != (3,):
-
-        return (
-            False,
-            "intercept_shape_incompatible",
-        )
+        return None, "legacy_intercept_shape_invalid"
 
     if scaler_mean.shape != (
         expected_features,
     ):
-
-        return (
-            False,
-            "scaler_mean_incompatible",
-        )
+        return None, "legacy_scaler_mean_invalid"
 
     if scaler_scale.shape != (
         expected_features,
     ):
+        return None, "legacy_scaler_scale_invalid"
 
-        return (
-            False,
-            "scaler_scale_incompatible",
-        )
+    # ------------------------------------------------------------
+    # LEGACY CLASS ORDER
+    #
+    # Antiguo:
+    #   A = away
+    #   D = draw
+    #   H = home
+    #
+    # NESTOR actual:
+    #   0 = home
+    #   1 = draw
+    #   2 = away
+    #
+    # Por tanto:
+    #
+    #   [A, D, H]
+    #       ↓
+    #   [H, D, A]
+    #
+    # Reordenamos filas de coeficientes e interceptos.
+    # ------------------------------------------------------------
 
-    artifact_schema = artifact.get(
-        "feature_schema_version"
+    legacy_to_nestor = [
+        2,
+        1,
+        0,
+    ]
+
+    converted_coefficients = (
+        coefficients[
+            legacy_to_nestor
+        ]
     )
 
-    if (
-        artifact_schema
-        == FEATURE_SCHEMA_VERSION
-    ):
+    converted_intercept = (
+        intercept[
+            legacy_to_nestor
+        ]
+    )
 
-        return (
-            True,
-            "strict",
-        )
+    converted = {
 
-    # Compatibilidad de puente para modelos
-    # anteriores que no guardaban schema_version.
-    if artifact_schema in (
-        None,
-        "",
-    ):
+        "format_version": (
+            "NESTOR-LEGACY-BRIDGE-v1"
+        ),
 
-        return (
-            True,
-            "legacy_structural",
-        )
+        "model_type": (
+            "logistic_regression"
+        ),
+
+        "model_family": MODEL_FAMILY,
+
+        "model_protocol_version": (
+            MODEL_PROTOCOL_VERSION
+        ),
+
+        "feature_schema_version": (
+            FEATURE_SCHEMA_VERSION
+        ),
+
+        "features": FEATURE_NAMES,
+
+        "classes": [
+            0,
+            1,
+            2,
+        ],
+
+        "coefficients": (
+            converted_coefficients.tolist()
+        ),
+
+        "intercept": (
+            converted_intercept.tolist()
+        ),
+
+        "scaler_mean": (
+            scaler_mean.tolist()
+        ),
+
+        "scaler_scale": (
+            scaler_scale.tolist()
+        ),
+
+        "calibration": {
+            "method": "none",
+            "temperature": 1.0,
+        },
+
+        "legacy_source_model_type": (
+            model_type
+        ),
+
+        "legacy_source_classes": (
+            classes
+        ),
+
+        "legacy_class_conversion": (
+            "[A,D,H] -> [H,D,A] -> [0,1,2]"
+        ),
+    }
 
     return (
-        False,
-        "feature_schema_version_incompatible",
+        converted,
+        "legacy_multinomial_bridge",
     )
+
+
+def normalize_active_artifact(
+    row: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+
+    artifact = row.get(
+        "artifact"
+    )
+
+    if isinstance(
+        artifact,
+        dict,
+    ):
+
+        model_type = artifact.get(
+            "model_type"
+        )
+
+        if model_type == "logistic_regression":
+
+            if (
+                artifact.get(
+                    "features"
+                )
+                == FEATURE_NAMES
+            ):
+
+                return (
+                    artifact,
+                    "strict",
+                )
+
+    metrics = row.get(
+        "metrics"
+    )
+
+    if not isinstance(
+        metrics,
+        dict,
+    ):
+
+        return None, "metrics_missing"
+
+    # El campeón antiguo guarda el modelo
+    # dentro de metrics.
+    legacy_artifact, reason = (
+        convert_legacy_artifact(
+            metrics
+        )
+    )
+
+    if legacy_artifact is not None:
+
+        return (
+            legacy_artifact,
+            reason,
+        )
+
+    return None, reason
 
 
 def probabilities_from_artifact(
@@ -676,35 +741,7 @@ def load_active_model() -> dict[str, Any] | None:
     if not rows:
         return None
 
-    row = rows[0]
-
-    artifact = row.get(
-        "artifact"
-    )
-
-    if not isinstance(
-        artifact,
-        dict,
-    ):
-
-        metrics = row.get(
-            "metrics"
-        )
-
-        if (
-            isinstance(metrics, dict)
-            and "coefficients" in metrics
-        ):
-
-            artifact = metrics
-
-        else:
-
-            artifact = None
-
-    row["artifact"] = artifact
-
-    return row
+    return rows[0]
 
 
 def current_holdout_evaluation(
@@ -717,17 +754,13 @@ def current_holdout_evaluation(
     if not active_row:
         return None
 
-    artifact = active_row.get(
-        "artifact"
-    )
-
-    compatible, compatibility = (
-        validate_artifact_compatibility(
-            artifact
+    artifact, compatibility = (
+        normalize_active_artifact(
+            active_row
         )
     )
 
-    if not compatible:
+    if artifact is None:
 
         print(
             "Modelo activo no compatible "
@@ -802,85 +835,6 @@ def current_holdout_evaluation(
         )
 
         return None
-
-
-def split_dataset(
-    X: np.ndarray,
-    y: np.ndarray,
-    match_ids: list[int],
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    list[int],
-    str,
-    str,
-]:
-
-    train_end = int(
-        len(X) * TRAIN_RATIO
-    )
-
-    calibration_end = int(
-        len(X)
-        * (
-            TRAIN_RATIO
-            + CALIBRATION_RATIO
-        )
-    )
-
-    if (
-        train_end < 30
-        or calibration_end - train_end < 10
-        or len(X) - calibration_end < 10
-    ):
-
-        raise RuntimeError(
-            "El dataset no permite una "
-            "separación temporal 60/20/20 segura."
-        )
-
-    X_train = X[:train_end]
-    y_train = y[:train_end]
-
-    X_cal = X[
-        train_end:calibration_end
-    ]
-
-    y_cal = y[
-        train_end:calibration_end
-    ]
-
-    X_holdout = X[
-        calibration_end:
-    ]
-
-    y_holdout = y[
-        calibration_end:
-    ]
-
-    holdout_ids = match_ids[
-        calibration_end:
-    ]
-
-    fingerprint = dataset_fingerprint(
-        holdout_ids
-    )
-
-    return (
-        X_train,
-        y_train,
-        X_cal,
-        y_cal,
-        X_holdout,
-        y_holdout,
-        holdout_ids,
-        fingerprint,
-        str(len(X_holdout)),
-    )
 
 
 def save_candidate(
@@ -1006,12 +960,6 @@ def save_candidate(
         "model_protocol_version"
     ] = MODEL_PROTOCOL_VERSION
 
-    # ------------------------------------------------------------
-    # IMPORTANTE:
-    # Primero guardamos el challenger.
-    # Así un fallo del INSERT no toca al modelo activo.
-    # ------------------------------------------------------------
-
     initial_status = (
         "promotion_pending"
         if should_activate
@@ -1060,7 +1008,6 @@ def save_candidate(
 
         "artifact": artifact,
 
-        # Siempre nace inactivo.
         "active": False,
 
         "status": initial_status,
@@ -1121,17 +1068,12 @@ def save_candidate(
             "en model_versions."
         )
 
-    # ------------------------------------------------------------
-    # PROMOCIÓN CONTROLADA
-    # ------------------------------------------------------------
-
     if should_activate:
 
-        # Retirar el campeón anterior.
         supabase_patch(
             "model_versions",
             {
-                "active": "eq.true"
+                "active": "eq.true",
             },
             {
                 "active": False,
@@ -1139,11 +1081,10 @@ def save_candidate(
             },
         )
 
-        # Activar solamente el challenger recién guardado.
         activated = supabase_patch(
             "model_versions",
             {
-                "version": f"eq.{version}"
+                "version": f"eq.{version}",
             },
             {
                 "active": True,
@@ -1160,11 +1101,10 @@ def save_candidate(
 
     else:
 
-        # Actualizar el estado final.
         supabase_patch(
             "model_versions",
             {
-                "version": f"eq.{version}"
+                "version": f"eq.{version}",
             },
             {
                 "active": False,
@@ -1230,7 +1170,7 @@ def main() -> None:
     )
 
     print(
-        "Entrenamiento formal 1X2 v1.1"
+        "Entrenamiento formal 1X2 v1.2"
     )
 
     print(
@@ -1288,20 +1228,57 @@ def main() -> None:
         dtype=int,
     )
 
-    (
-        X_train,
-        y_train,
-        X_cal,
-        y_cal,
-        X_holdout,
-        y_holdout,
-        holdout_ids,
-        evaluation_fingerprint,
-        holdout_size_text,
-    ) = split_dataset(
-        X,
-        y,
-        match_ids,
+    train_end = int(
+        len(X) * TRAIN_RATIO
+    )
+
+    calibration_end = int(
+        len(X)
+        * (
+            TRAIN_RATIO
+            + CALIBRATION_RATIO
+        )
+    )
+
+    if (
+        train_end < 30
+        or calibration_end - train_end < 10
+        or len(X) - calibration_end < 10
+    ):
+
+        raise RuntimeError(
+            "El dataset no permite una "
+            "separación temporal 60/20/20 segura."
+        )
+
+    X_train = X[:train_end]
+
+    y_train = y[:train_end]
+
+    X_cal = X[
+        train_end:calibration_end
+    ]
+
+    y_cal = y[
+        train_end:calibration_end
+    ]
+
+    X_holdout = X[
+        calibration_end:
+    ]
+
+    y_holdout = y[
+        calibration_end:
+    ]
+
+    holdout_ids = match_ids[
+        calibration_end:
+    ]
+
+    evaluation_fingerprint = (
+        dataset_fingerprint(
+            holdout_ids
+        )
     )
 
     print(
