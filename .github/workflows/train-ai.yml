@@ -1,39 +1,27 @@
-name: Entrenar IA Futbol IA
+name: Entrenar IA desde Supabase
 
 on:
   workflow_dispatch:
 
 jobs:
   train:
-    name: Entrenar modelo
     runs-on: ubuntu-latest
 
     steps:
-      - name: Descargar codigo
+      - name: Descargar proyecto
         uses: actions/checkout@v4
 
-      - name: Configurar Python
+      - name: Configurar Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
       - name: Instalar dependencias
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Entrenar modelo
+      - name: Entrenar IA con historial existente en Supabase
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-        run: |
-          echo "========================================"
-          echo "FUTBOL IA"
-          echo "ENTRENAMIENTO DEL MODELO 1X2"
-          echo "========================================"
-
-          python app/train_ai.py
-
-          echo ""
-          echo "========================================"
-          echo "ENTRENAMIENTO TERMINADO"
-          echo "========================================"
+        run: python app/train_ai.py
