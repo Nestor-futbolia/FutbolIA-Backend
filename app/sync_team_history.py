@@ -2,41 +2,62 @@ import os
 import time
 import requests
 
+
 BASE_URL = "https://v3.football.api-sports.io"
-HISTORICAL_SEASON = 2024
 
-# API-Football Free:
-# 100 solicitudes/día
-# 10 solicitudes/minuto
-#
-# Dejamos un presupuesto pequeño por ejecución para no consumir
-# toda la cuota de una sola vez.
+HISTORICAL_SEASON = int(
+    os.getenv("HISTORICAL_SEASON", "2024")
+)
+
+BATCH_INDEX = int(
+    os.getenv("LEAGUE_BATCH", "0")
+)
+
+# Máximo de llamadas API-Football por ejecución.
 MAX_API_CALLS_PER_RUN = 20
-SECONDS_BETWEEN_API_CALLS = 7
-MIN_DAILY_REMAINING_TO_CONTINUE = 6
 
-# Ligas prioritarias.
-# Una consulta por liga/temporada puede devolver muchos partidos.
+# Free = 10/min.
+# Usamos 8 segundos para mantenernos claramente por debajo.
+SECONDS_BETWEEN_API_CALLS = 8
+
+# Si el encabezado indica pocas solicitudes restantes,
+# dejamos margen de seguridad.
+MIN_DAILY_REMAINING = 6
+
+
+# ============================================================
+# LIGAS PRIORITARIAS
+# ============================================================
+
 PRIORITY_LEAGUES = [
     (39, "Premier League", "England"),
     (140, "La Liga", "Spain"),
     (135, "Serie A", "Italy"),
     (78, "Bundesliga", "Germany"),
+
     (61, "Ligue 1", "France"),
     (40, "Championship", "England"),
     (88, "Eredivisie", "Netherlands"),
     (94, "Primeira Liga", "Portugal"),
-    (71, "Serie A", "Brazil"),
+
+    (71, "Serie A Brazil", "Brazil"),
     (253, "MLS", "USA"),
     (2, "UEFA Champions League", "Europe"),
     (3, "UEFA Europa League", "Europe"),
+
     (13, "CONMEBOL Libertadores", "South America"),
     (242, "Liga Pro", "Ecuador"),
 ]
 
+
+# ============================================================
+# VARIABLES
+# ============================================================
+
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
+
 
 if not API_FOOTBALL_KEY:
     raise RuntimeError("Falta API_FOOTBALL_KEY")
@@ -54,6 +75,7 @@ SUPABASE_HEADERS = {
     "Content-Type": "application/json",
 }
 
+
 API_HEADERS = {
     "x-apisports-key": API_FOOTBALL_KEY
 }
@@ -64,8 +86,28 @@ daily_remaining = None
 minute_remaining = None
 
 
+# ============================================================
+# EXCEPCIONES CONTROLADAS
+# ============================================================
+
+class DailyQuotaReached(Exception):
+    pass
+
+
+class ApiCallBudgetReached(Exception):
+    pass
+
+
+# ============================================================
+# SUPABASE
+# ============================================================
+
 def supabase_get(path, params=None):
-    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{path}"
+
+    url = (
+        f"{SUPABASE_URL.rstrip('/')}"
+        f"/rest/v1/{path}"
+    )
 
     response = requests.get(
         url,
@@ -78,27 +120,39 @@ def supabase_get(path, params=None):
         raise RuntimeError(
             f"Supabase GET {path}: "
             f"HTTP {response.status_code}: "
-            f"{response.text[:700]}"
+            f"{response.text[:1000]}"
         )
 
     return response.json()
 
 
-def supabase_upsert(path, rows, on_conflict):
-    if not rows:
-        return 0
+def supabase_upsert(
+    path,
+    rows,
+    on_conflict="id",
+):
 
-    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{path}"
+    if not rows:
+        return
+
+    url = (
+        f"{SUPABASE_URL.rstrip('/')}"
+        f"/rest/v1/{path}"
+    )
 
     headers = dict(SUPABASE_HEADERS)
+
     headers["Prefer"] = (
-        "resolution=merge-duplicates,return=minimal"
+        "resolution=merge-duplicates,"
+        "return=minimal"
     )
 
     response = requests.post(
         url,
         headers=headers,
-        params={"on_conflict": on_conflict},
+        params={
+            "on_conflict": on_conflict
+        },
         json=rows,
         timeout=120,
     )
@@ -110,19 +164,75 @@ def supabase_upsert(path, rows, on_conflict):
             f"{response.text[:1000]}"
         )
 
-    return len(rows)
+
+# ============================================================
+# ESPERA ENTRE LLAMADAS
+# ============================================================
+
+_last_api_call_time = 0.0
 
 
-def football_get(endpoint, params):
+def wait_before_api_call():
+
+    global _last_api_call_time
+
+    now = time.time()
+
+    elapsed = (
+        now - _last_api_call_time
+    )
+
+    if elapsed < SECONDS_BETWEEN_API_CALLS:
+
+        wait_time = (
+            SECONDS_BETWEEN_API_CALLS
+            - elapsed
+        )
+
+        print(
+            f"Esperando {wait_time:.1f}s "
+            "antes de la siguiente llamada..."
+        )
+
+        time.sleep(wait_time)
+
+    _last_api_call_time = time.time()
+
+
+# ============================================================
+# API-FOOTBALL
+# ============================================================
+
+def football_get(
+    endpoint,
+    params,
+):
+
     global api_calls
     global daily_remaining
     global minute_remaining
 
     if api_calls >= MAX_API_CALLS_PER_RUN:
-        raise StopIteration(
-            "Presupuesto de seguridad alcanzado: "
-            f"{MAX_API_CALLS_PER_RUN} solicitudes."
+
+        raise ApiCallBudgetReached(
+            f"Se alcanzó el máximo de "
+            f"{MAX_API_CALLS_PER_RUN} "
+            "llamadas de esta ejecución."
         )
+
+    if (
+        daily_remaining is not None
+        and daily_remaining
+        <= MIN_DAILY_REMAINING
+    ):
+
+        raise DailyQuotaReached(
+            f"Quedan solamente "
+            f"{daily_remaining} "
+            "solicitudes diarias."
+        )
+
+    wait_before_api_call()
 
     response = requests.get(
         f"{BASE_URL}{endpoint}",
@@ -163,21 +273,83 @@ def football_get(endpoint, params):
         f"API {endpoint} "
         f"HTTP {response.status_code} | "
         f"llamada #{api_calls} | "
-        f"diarias_restantes={daily_raw or '?'} | "
-        f"minuto_restantes={minute_raw or '?'}"
+        f"daily={daily_raw or '?'} | "
+        f"minute={minute_raw or '?'}"
     )
 
-    if not response.ok:
+    # --------------------------------------------------------
+    # HTTP 429
+    # --------------------------------------------------------
+
+    if response.status_code == 429:
+
+        text = response.text.lower()
+
+        if (
+            "day" in text
+            or "daily" in text
+        ):
+
+            raise DailyQuotaReached(
+                "API-Football indicó "
+                "límite diario agotado."
+            )
+
         raise RuntimeError(
-            f"API-Football HTTP {response.status_code}: "
+            "API-Football HTTP 429: "
+            f"{response.text[:1000]}"
+        )
+
+    # --------------------------------------------------------
+    # OTROS ERRORES HTTP
+    # --------------------------------------------------------
+
+    if not response.ok:
+
+        raise RuntimeError(
+            f"API-Football HTTP "
+            f"{response.status_code}: "
             f"{response.text[:1000]}"
         )
 
     data = response.json()
 
+    # --------------------------------------------------------
+    # MUY IMPORTANTE:
+    # API-Football puede devolver HTTP 200
+    # pero contener un error dentro de "errors".
+    # --------------------------------------------------------
+
     errors = data.get("errors") or {}
 
     if errors:
+
+        error_text = str(errors)
+
+        print(
+            "API-Football devolvió errors: "
+            f"{error_text}"
+        )
+
+        lower_error = error_text.lower()
+
+        # Si el cuerpo dice que la cuota diaria está
+        # agotada, NOS DETENEMOS INMEDIATAMENTE.
+        if (
+            "request limit for the day"
+            in lower_error
+            or "limit for the day"
+            in lower_error
+            or "daily" in lower_error
+            or "day" in lower_error
+            and "limit" in lower_error
+        ):
+
+            raise DailyQuotaReached(
+                "API-Football confirmó "
+                "que la cuota diaria está agotada."
+            )
+
         raise RuntimeError(
             f"API-Football errors: {errors}"
         )
@@ -185,60 +357,16 @@ def football_get(endpoint, params):
     return data
 
 
-def choose_leagues():
-    """
-    Prioriza ligas que todavía no tienen partidos 2024
-    almacenados en Supabase.
+# ============================================================
+# GUARDAR LIGA Y TEMPORADA
+# ============================================================
 
-    Esta función NO consume solicitudes de API-Football.
-    """
-
-    states = {}
-
-    for league_id, name, country in PRIORITY_LEAGUES:
-
-        rows = supabase_get(
-            "matches",
-            {
-                "select": "id",
-                "league_id": f"eq.{league_id}",
-                "season_id": f"eq.{HISTORICAL_SEASON}",
-                "limit": 1,
-            },
-        )
-
-        states[league_id] = bool(rows)
-
-    ordered = sorted(
-        PRIORITY_LEAGUES,
-        key=lambda item: (
-            states[item[0]],
-            PRIORITY_LEAGUES.index(item),
-        ),
-    )
-
-    print("Prioridad de ligas:")
-
-    for league_id, name, country in ordered:
-        state = (
-            "YA TIENE DATOS"
-            if states[league_id]
-            else "SIN DATOS"
-        )
-
-        print(
-            f"  {league_id} - {name} "
-            f"({country}) -> {state}"
-        )
-
-    return ordered
-
-
-def save_league_and_season(
+def ensure_league_and_season(
     league_id,
     league_name,
     country,
 ):
+
     supabase_upsert(
         "leagues",
         [
@@ -253,18 +381,37 @@ def save_league_and_season(
         "id",
     )
 
-    supabase_upsert(
+    # La tabla seasons utiliza el año como ID
+    # en la estructura actual del proyecto.
+    existing = supabase_get(
         "seasons",
-        [
-            {
-                "id": HISTORICAL_SEASON,
-                "league_id": league_id,
-                "name": str(HISTORICAL_SEASON),
-            }
-        ],
-        "id",
+        {
+            "id": f"eq.{HISTORICAL_SEASON}",
+            "select": "id",
+            "limit": 1,
+        },
     )
 
+    if not existing:
+
+        supabase_upsert(
+            "seasons",
+            [
+                {
+                    "id": HISTORICAL_SEASON,
+                    "league_id": league_id,
+                    "name": str(
+                        HISTORICAL_SEASON
+                    ),
+                }
+            ],
+            "id",
+        )
+
+
+# ============================================================
+# GUARDAR FIXTURES
+# ============================================================
 
 def save_fixtures(
     fixtures,
@@ -272,69 +419,116 @@ def save_fixtures(
     league_name,
     country,
 ):
+
     teams = {}
     matches = {}
 
+    finished_statuses = {
+        "FT",
+        "AET",
+        "PEN",
+    }
+
     for item in fixtures:
 
-        fixture = item.get("fixture") or {}
-        teams_obj = item.get("teams") or {}
-        goals = item.get("goals") or {}
+        fixture = (
+            item.get("fixture") or {}
+        )
 
-        score = item.get("score") or {}
-        halftime = score.get("halftime") or {}
+        status = (
+            fixture.get("status") or {}
+        ).get("short")
+
+        # Solo partidos terminados.
+        if status not in finished_statuses:
+            continue
 
         fixture_id = fixture.get("id")
 
-        home = teams_obj.get("home") or {}
-        away = teams_obj.get("away") or {}
+        teams_obj = (
+            item.get("teams") or {}
+        )
 
-        if (
-            fixture_id is None
-            or home.get("id") is None
-            or away.get("id") is None
-        ):
+        home = (
+            teams_obj.get("home") or {}
+        )
+
+        away = (
+            teams_obj.get("away") or {}
+        )
+
+        if not fixture_id:
             continue
 
-        for team in (home, away):
+        if not home.get("id"):
+            continue
 
-            team_id = int(team["id"])
+        if not away.get("id"):
+            continue
 
-            teams[team_id] = {
-                "id": team_id,
-                "name": (
-                    team.get("name")
-                    or f"Team {team_id}"
-                ),
-                "short_code": team.get("code"),
-                "country": country,
-                "venue_name": None,
-                "league_id": league_id,
-            }
+        goals = (
+            item.get("goals") or {}
+        )
+
+        score = (
+            item.get("score") or {}
+        )
+
+        halftime = (
+            score.get("halftime") or {}
+        )
+
+        home_id = int(home["id"])
+        away_id = int(away["id"])
+
+        teams[home_id] = {
+            "id": home_id,
+            "name": (
+                home.get("name")
+                or f"Team {home_id}"
+            ),
+            "short_code": home.get("code"),
+            "country": country,
+            "league_id": league_id,
+        }
+
+        teams[away_id] = {
+            "id": away_id,
+            "name": (
+                away.get("name")
+                or f"Team {away_id}"
+            ),
+            "short_code": away.get("code"),
+            "country": country,
+            "league_id": league_id,
+        }
 
         matches[int(fixture_id)] = {
             "id": int(fixture_id),
             "league_id": league_id,
             "season_id": HISTORICAL_SEASON,
-            "home_team_id": int(home["id"]),
-            "away_team_id": int(away["id"]),
-            "starting_at": fixture.get("date"),
-            "status": (
-                fixture.get("status") or {}
-            ).get("short"),
-            "home_goals": goals.get("home"),
-            "away_goals": goals.get("away"),
-            "home_ht_goals": halftime.get("home"),
-            "away_ht_goals": halftime.get("away"),
+            "home_team_id": home_id,
+            "away_team_id": away_id,
+            "starting_at": fixture.get(
+                "date"
+            ),
+            "status": status,
+            "home_goals": goals.get(
+                "home"
+            ),
+            "away_goals": goals.get(
+                "away"
+            ),
+            "home_ht_goals": halftime.get(
+                "home"
+            ),
+            "away_ht_goals": halftime.get(
+                "away"
+            ),
         }
 
-    save_league_and_season(
-        league_id,
-        league_name,
-        country,
-    )
-
     if teams:
+
         supabase_upsert(
             "teams",
             list(teams.values()),
@@ -342,6 +536,7 @@ def save_fixtures(
         )
 
     if matches:
+
         supabase_upsert(
             "matches",
             list(matches.values()),
@@ -351,28 +546,34 @@ def save_fixtures(
     return len(matches)
 
 
-def fetch_league(
+# ============================================================
+# SINCRONIZAR UNA LIGA
+# ============================================================
+
+def sync_league(
     league_id,
     league_name,
     country,
 ):
-    total_received = 0
-    total_saved = 0
+
+    print("")
+    print(
+        f"=== {league_name} "
+        f"({league_id}) ==="
+    )
+
+    ensure_league_and_season(
+        league_id,
+        league_name,
+        country,
+    )
 
     page = 1
 
-    while True:
+    total_received = 0
+    total_saved = 0
 
-        if (
-            daily_remaining is not None
-            and daily_remaining
-            < MIN_DAILY_REMAINING_TO_CONTINUE
-        ):
-            raise StopIteration(
-                "Solo quedan "
-                f"{daily_remaining} solicitudes diarias. "
-                "Se detiene antes de agotar la cuota."
-            )
+    while True:
 
         data = football_get(
             "/fixtures",
@@ -384,179 +585,240 @@ def fetch_league(
             },
         )
 
-        fixtures = data.get("response") or []
+        fixtures = (
+            data.get("response") or []
+        )
 
         total_received += len(fixtures)
 
-        paging = data.get("paging") or {}
+        paging = (
+            data.get("paging") or {}
+        )
+
+        current_page = int(
+            paging.get(
+                "current",
+                page,
+            )
+        )
 
         total_pages = int(
-            paging.get("total") or 1
+            paging.get(
+                "total",
+                1,
+            )
         )
 
         print(
             f"{league_name}: "
-            f"página {page}/{total_pages} | "
-            f"partidos={len(fixtures)}"
+            f"página {current_page}/"
+            f"{total_pages} | "
+            f"recibidos={len(fixtures)}"
         )
 
-        if fixtures:
-            saved = save_fixtures(
-                fixtures,
-                league_id,
-                league_name,
-                country,
-            )
+        saved = save_fixtures(
+            fixtures,
+            league_id,
+            league_name,
+            country,
+        )
 
-            total_saved += saved
+        total_saved += saved
 
-        if page >= total_pages:
+        print(
+            f"{league_name}: "
+            f"guardados={saved}"
+        )
+
+        if current_page >= total_pages:
             break
 
-        page += 1
+        page = current_page + 1
 
-        time.sleep(
-            SECONDS_BETWEEN_API_CALLS
+    return (
+        total_received,
+        total_saved,
+    )
+
+
+# ============================================================
+# SELECCIONAR SOLO UN LOTE
+# ============================================================
+
+def get_batch():
+
+    batch_size = 4
+
+    start = (
+        BATCH_INDEX * batch_size
+    )
+
+    end = start + batch_size
+
+    batch = PRIORITY_LEAGUES[
+        start:end
+    ]
+
+    if not batch:
+
+        raise RuntimeError(
+            f"El lote {BATCH_INDEX} "
+            "no existe."
         )
 
-    return total_received, total_saved
+    return batch
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
     print(
-        "=== FÚTBOL IA - "
-        "RECOLECTOR HISTÓRICO V2 ==="
+        "======================================"
     )
 
     print(
-        f"Temporada: {HISTORICAL_SEASON}"
+        "FÚTBOL IA - "
+        "RECOLECTOR HISTÓRICO V3"
     )
 
     print(
-        "Máximo de solicitudes por ejecución: "
+        "======================================"
+    )
+
+    print(
+        f"Temporada: "
+        f"{HISTORICAL_SEASON}"
+    )
+
+    print(
+        f"Lote: "
+        f"{BATCH_INDEX}"
+    )
+
+    print(
+        f"Máximo llamadas: "
         f"{MAX_API_CALLS_PER_RUN}"
     )
 
     print(
-        "Espera entre llamadas: "
+        f"Espera: "
         f"{SECONDS_BETWEEN_API_CALLS}s"
     )
 
-    print(
-        "Solo fixtures finalizados."
-    )
-
-    print(
-        "No se descargan estadísticas "
-        "en este paso."
-    )
-
-    print(
-        "No se consulta API-Football "
-        "para descubrir ligas."
-    )
-
     print("")
 
-    leagues = choose_leagues()
+    batch = get_batch()
+
+    print(
+        "Ligas de este lote:"
+    )
+
+    for league_id, name, country in batch:
+
+        print(
+            f"  {league_id} - "
+            f"{name} - "
+            f"{country}"
+        )
 
     total_received = 0
     total_saved = 0
-    completed_leagues = 0
+    completed = 0
 
-    stopped_by_budget = False
+    try:
 
-    errors = []
+        for (
+            league_id,
+            league_name,
+            country,
+        ) in batch:
 
-    for index, (
-        league_id,
-        league_name,
-        country,
-    ) in enumerate(
-        leagues,
-        start=1,
-    ):
+            try:
 
-        if api_calls >= MAX_API_CALLS_PER_RUN:
-            stopped_by_budget = True
-            break
+                received, saved = (
+                    sync_league(
+                        league_id,
+                        league_name,
+                        country,
+                    )
+                )
 
-        if (
-            daily_remaining is not None
-            and daily_remaining
-            < MIN_DAILY_REMAINING_TO_CONTINUE
-        ):
-            stopped_by_budget = True
-            break
+                total_received += received
+                total_saved += saved
 
-        print("")
+                completed += 1
+
+                print(
+                    f"COMPLETADA: "
+                    f"{league_name} | "
+                    f"recibidos={received} | "
+                    f"guardados={saved}"
+                )
+
+            except DailyQuotaReached as exc:
+
+                print("")
+                print(
+                    "CUOTA DIARIA ALCANZADA."
+                )
+
+                print(
+                    str(exc)
+                )
+
+                print(
+                    "La ejecución se detiene "
+                    "sin intentar más ligas."
+                )
+
+                break
+
+            except ApiCallBudgetReached as exc:
+
+                print("")
+                print(
+                    "PRESUPUESTO DE LLAMADAS "
+                    "ALCANZADO."
+                )
+
+                print(
+                    str(exc)
+                )
+
+                break
+
+            # Si todavía quedan ligas del lote,
+            # respetamos la velocidad de API.
+            if completed < len(batch):
+
+                time.sleep(
+                    SECONDS_BETWEEN_API_CALLS
+                )
+
+    except DailyQuotaReached as exc:
+
         print(
-            f"--- LIGA {index}/"
-            f"{len(leagues)}: "
-            f"{league_name} "
-            f"({league_id}) ---"
+            "CUOTA DIARIA: "
+            f"{exc}"
         )
 
-        try:
-
-            received, saved = fetch_league(
-                league_id,
-                league_name,
-                country,
-            )
-
-            total_received += received
-            total_saved += saved
-
-            completed_leagues += 1
-
-            print(
-                f"Resultado {league_name}: "
-                f"recibidos={received}, "
-                f"guardados/actualizados={saved}"
-            )
-
-        except StopIteration as exc:
-
-            print(
-                f"PAUSA CONTROLADA: {exc}"
-            )
-
-            stopped_by_budget = True
-            break
-
-        except Exception as exc:
-
-            print(
-                f"ERROR en {league_name}: "
-                f"{exc}"
-            )
-
-            errors.append(
-                (
-                    league_id,
-                    league_name,
-                    str(exc),
-                )
-            )
-
-        if index < len(leagues):
-
-            time.sleep(
-                SECONDS_BETWEEN_API_CALLS
-            )
-
     print("")
-    print("=== RESUMEN ===")
+    print(
+        "======================================"
+    )
+
+    print("RESUMEN")
 
     print(
         f"Ligas completadas: "
-        f"{completed_leagues}"
+        f"{completed}/{len(batch)}"
     )
 
     print(
-        f"Solicitudes API utilizadas: "
+        f"Llamadas API utilizadas: "
         f"{api_calls}"
     )
 
@@ -571,53 +833,39 @@ def main():
     )
 
     print(
-        f"Daily remaining: "
+        f"Daily remaining header: "
         f"{daily_remaining}"
     )
 
     print(
-        f"Minute remaining: "
+        f"Minute remaining header: "
         f"{minute_remaining}"
     )
 
     print(
-        f"Errores: "
-        f"{len(errors)}"
+        "======================================"
     )
 
-    print(
-        f"Detención por presupuesto/cuota: "
-        f"{stopped_by_budget}"
-    )
-
-    for (
-        league_id,
-        league_name,
-        error,
-    ) in errors:
+    if completed == 0:
 
         print(
-            f"  - {league_name} "
-            f"({league_id}): "
-            f"{error}"
+            "No se completó ninguna liga."
         )
 
-    if errors:
-        raise RuntimeError(
-            "La ejecución tuvo errores. "
-            "Los datos guardados antes del "
-            "error permanecen en Supabase."
+        print(
+            "Si API-Football informó "
+            "cuota agotada, simplemente "
+            "esperaremos al siguiente "
+            "reinicio de cuota."
         )
 
-    if total_received == 0:
-        raise RuntimeError(
-            "No se recibieron partidos históricos."
-        )
+        # No provocamos un fallo adicional.
+        return
 
     print("")
     print(
-        "HISTORIAL OPTIMIZADO "
-        "CARGADO CORRECTAMENTE"
+        "SINCRONIZACIÓN TERMINADA "
+        "CORRECTAMENTE."
     )
 
 
