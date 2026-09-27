@@ -25,15 +25,26 @@ SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "").strip()
 
 MODEL_NAME = "NESTOR-1X2-LogisticRegression"
 MODEL_FAMILY = "1X2"
-MODEL_PROTOCOL_VERSION = "NESTOR-EVAL-v1.0"
+
+# Protocolo común de evaluación.
+MODEL_PROTOCOL_VERSION = "NESTOR-EVAL-v1.1"
 
 MIN_MATCHES = 80
 WINDOW = 5
 PAGE_SIZE = 1000
 
+# Calibración por temperature scaling.
 CALIBRATION_GRID = np.linspace(0.50, 3.00, 101)
 
+# Un challenger debe mejorar el log loss por más de este margen.
 ACTIVATION_MARGIN = 0.001
+
+# División temporal:
+# 60% entrenamiento
+# 20% calibración
+# 20% holdout común
+TRAIN_RATIO = 0.60
+CALIBRATION_RATIO = 0.20
 
 
 if not SUPABASE_URL:
@@ -56,14 +67,14 @@ def supabase_url(table: str) -> str:
 
 def supabase_get(
     table: str,
-    params: dict[str, Any]
+    params: dict[str, Any],
 ) -> list[dict[str, Any]]:
 
     with httpx.Client(timeout=60.0) as client:
         response = client.get(
             supabase_url(table),
             headers=HEADERS,
-            params=params
+            params=params,
         )
 
     if response.status_code not in (200, 206):
@@ -80,19 +91,19 @@ def supabase_get(
 
 def supabase_post(
     table: str,
-    payload: dict[str, Any]
+    payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
 
     headers = {
         **HEADERS,
-        "Prefer": "return=representation"
+        "Prefer": "return=representation",
     }
 
     with httpx.Client(timeout=60.0) as client:
         response = client.post(
             supabase_url(table),
             headers=headers,
-            json=payload
+            json=payload,
         )
 
     if response.status_code not in (200, 201):
@@ -108,12 +119,12 @@ def supabase_post(
 def supabase_patch(
     table: str,
     params: dict[str, Any],
-    payload: dict[str, Any]
+    payload: dict[str, Any],
 ) -> list[dict[str, Any]]:
 
     headers = {
         **HEADERS,
-        "Prefer": "return=representation"
+        "Prefer": "return=representation",
     }
 
     with httpx.Client(timeout=60.0) as client:
@@ -121,7 +132,7 @@ def supabase_patch(
             supabase_url(table),
             headers=headers,
             params=params,
-            json=payload
+            json=payload,
         )
 
     if response.status_code not in (200, 204):
@@ -175,7 +186,7 @@ def load_finished_matches() -> list[dict[str, Any]]:
 
 
 def normalize_matches(
-    rows: list[dict[str, Any]]
+    rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
 
     seen: set[int] = set()
@@ -199,7 +210,7 @@ def normalize_matches(
     cleaned.sort(
         key=lambda item: (
             item["starting_at"],
-            item["id"]
+            item["id"],
         )
     )
 
@@ -207,7 +218,7 @@ def normalize_matches(
 
 
 def dataset_fingerprint(
-    match_ids: list[int]
+    match_ids: list[int],
 ) -> str:
 
     raw = ":".join(
@@ -222,7 +233,7 @@ def dataset_fingerprint(
 
 def brier_multiclass(
     y_true: np.ndarray,
-    probabilities: np.ndarray
+    probabilities: np.ndarray,
 ) -> float:
 
     one_hot = np.zeros_like(probabilities)
@@ -234,7 +245,7 @@ def brier_multiclass(
         np.mean(
             np.sum(
                 (probabilities - one_hot) ** 2,
-                axis=1
+                axis=1,
             )
         )
     )
@@ -242,12 +253,12 @@ def brier_multiclass(
 
 def softmax(
     logits: np.ndarray,
-    temperature: float = 1.0
+    temperature: float = 1.0,
 ) -> np.ndarray:
 
     t = max(
         float(temperature),
-        0.05
+        0.05,
     )
 
     z = logits / t
@@ -255,7 +266,7 @@ def softmax(
     z = z - np.max(
         z,
         axis=1,
-        keepdims=True
+        keepdims=True,
     )
 
     exp_z = np.exp(z)
@@ -263,13 +274,13 @@ def softmax(
     return exp_z / np.sum(
         exp_z,
         axis=1,
-        keepdims=True
+        keepdims=True,
     )
 
 
 def fit_temperature(
     logits: np.ndarray,
-    y: np.ndarray
+    y: np.ndarray,
 ) -> float:
 
     best_t = 1.0
@@ -279,14 +290,14 @@ def fit_temperature(
 
         probabilities = softmax(
             logits,
-            float(candidate)
+            float(candidate),
         )
 
         loss = float(
             log_loss(
                 y,
                 probabilities,
-                labels=[0, 1, 2]
+                labels=[0, 1, 2],
             )
         )
 
@@ -301,7 +312,7 @@ def model_probabilities(
     model: LogisticRegression,
     scaler: StandardScaler,
     X: np.ndarray,
-    temperature: float
+    temperature: float,
 ) -> np.ndarray:
 
     Xs = scaler.transform(X)
@@ -313,24 +324,24 @@ def model_probabilities(
 
     return softmax(
         logits,
-        temperature
+        temperature,
     )
 
 
 def feature_defaults(
-    X_train: np.ndarray
+    X_train: np.ndarray,
 ) -> dict[str, float]:
 
     medians = np.median(
         X_train,
-        axis=0
+        axis=0,
     )
 
     return {
         name: float(value)
         for name, value in zip(
             FEATURE_NAMES,
-            medians
+            medians,
         )
     }
 
@@ -348,11 +359,15 @@ def serialize_artifact(
 ) -> dict[str, Any]:
 
     return {
-        "format_version": "NESTOR-MODEL-v1.0",
+        "format_version": "NESTOR-MODEL-v1.1",
 
         "model_type": "logistic_regression",
 
         "model_family": MODEL_FAMILY,
+
+        "model_protocol_version": (
+            MODEL_PROTOCOL_VERSION
+        ),
 
         "feature_schema_version": (
             FEATURE_SCHEMA_VERSION
@@ -363,7 +378,7 @@ def serialize_artifact(
         "classes": [
             0,
             1,
-            2
+            2,
         ],
 
         "coefficients": [
@@ -420,35 +435,195 @@ def serialize_artifact(
     }
 
 
+def validate_artifact_compatibility(
+    artifact: dict[str, Any] | None,
+) -> tuple[bool, str]:
+
+    if not isinstance(
+        artifact,
+        dict,
+    ):
+        return (
+            False,
+            "artifact_missing",
+        )
+
+    if artifact.get(
+        "model_type"
+    ) != "logistic_regression":
+
+        return (
+            False,
+            "model_type_incompatible",
+        )
+
+    features = artifact.get(
+        "features"
+    )
+
+    if features != FEATURE_NAMES:
+
+        return (
+            False,
+            "feature_names_incompatible",
+        )
+
+    classes = artifact.get(
+        "classes"
+    )
+
+    if classes is not None:
+        try:
+            normalized_classes = [
+                int(value)
+                for value in classes
+            ]
+        except Exception:
+            return (
+                False,
+                "classes_invalid",
+            )
+
+        if normalized_classes != [
+            0,
+            1,
+            2,
+        ]:
+
+            return (
+                False,
+                "classes_incompatible",
+            )
+
+    try:
+
+        coefficients = np.asarray(
+            artifact["coefficients"],
+            dtype=float,
+        )
+
+        intercept = np.asarray(
+            artifact["intercept"],
+            dtype=float,
+        )
+
+        scaler_mean = np.asarray(
+            artifact["scaler_mean"],
+            dtype=float,
+        )
+
+        scaler_scale = np.asarray(
+            artifact["scaler_scale"],
+            dtype=float,
+        )
+
+    except Exception:
+
+        return (
+            False,
+            "artifact_arrays_invalid",
+        )
+
+    expected_features = len(
+        FEATURE_NAMES
+    )
+
+    if coefficients.shape != (
+        3,
+        expected_features,
+    ):
+
+        return (
+            False,
+            "coefficient_shape_incompatible",
+        )
+
+    if intercept.shape != (3,):
+
+        return (
+            False,
+            "intercept_shape_incompatible",
+        )
+
+    if scaler_mean.shape != (
+        expected_features,
+    ):
+
+        return (
+            False,
+            "scaler_mean_incompatible",
+        )
+
+    if scaler_scale.shape != (
+        expected_features,
+    ):
+
+        return (
+            False,
+            "scaler_scale_incompatible",
+        )
+
+    artifact_schema = artifact.get(
+        "feature_schema_version"
+    )
+
+    if (
+        artifact_schema
+        == FEATURE_SCHEMA_VERSION
+    ):
+
+        return (
+            True,
+            "strict",
+        )
+
+    # Compatibilidad de puente para modelos
+    # anteriores que no guardaban schema_version.
+    if artifact_schema in (
+        None,
+        "",
+    ):
+
+        return (
+            True,
+            "legacy_structural",
+        )
+
+    return (
+        False,
+        "feature_schema_version_incompatible",
+    )
+
+
 def probabilities_from_artifact(
     artifact: dict[str, Any],
-    X: np.ndarray
+    X: np.ndarray,
 ) -> np.ndarray:
 
     coefficients = np.asarray(
         artifact["coefficients"],
-        dtype=float
+        dtype=float,
     )
 
     intercept = np.asarray(
         artifact["intercept"],
-        dtype=float
+        dtype=float,
     )
 
     mean = np.asarray(
         artifact["scaler_mean"],
-        dtype=float
+        dtype=float,
     )
 
     scale = np.asarray(
         artifact["scaler_scale"],
-        dtype=float
+        dtype=float,
     )
 
     scale = np.where(
         np.abs(scale) < 1e-12,
         1.0,
-        scale
+        scale,
     )
 
     Xs = (
@@ -468,7 +643,7 @@ def probabilities_from_artifact(
 
     return softmax(
         logits,
-        temperature
+        temperature,
     )
 
 
@@ -509,7 +684,7 @@ def load_active_model() -> dict[str, Any] | None:
 
     if not isinstance(
         artifact,
-        dict
+        dict,
     ):
 
         metrics = row.get(
@@ -520,8 +695,11 @@ def load_active_model() -> dict[str, Any] | None:
             isinstance(metrics, dict)
             and "coefficients" in metrics
         ):
+
             artifact = metrics
+
         else:
+
             artifact = None
 
     row["artifact"] = artifact
@@ -532,45 +710,56 @@ def load_active_model() -> dict[str, Any] | None:
 def current_holdout_evaluation(
     active_row: dict[str, Any] | None,
     X_holdout: np.ndarray,
-    y_holdout: np.ndarray
-) -> dict[str, float] | None:
+    y_holdout: np.ndarray,
+    holdout_ids: list[int],
+) -> dict[str, Any] | None:
 
-    if (
-        not active_row
-        or not isinstance(
-            active_row.get("artifact"),
-            dict
-        )
-    ):
+    if not active_row:
         return None
 
-    artifact = active_row["artifact"]
+    artifact = active_row.get(
+        "artifact"
+    )
 
-    if (
-        artifact.get(
-            "feature_schema_version"
+    compatible, compatibility = (
+        validate_artifact_compatibility(
+            artifact
         )
-        != FEATURE_SCHEMA_VERSION
-    ):
+    )
+
+    if not compatible:
+
+        print(
+            "Modelo activo no compatible "
+            "con el holdout común: "
+            f"{compatibility}"
+        )
+
         return None
 
     try:
 
-        probabilities = probabilities_from_artifact(
-            artifact,
-            X_holdout
+        probabilities = (
+            probabilities_from_artifact(
+                artifact,
+                X_holdout,
+            )
         )
 
         predictions = np.argmax(
             probabilities,
-            axis=1
+            axis=1,
+        )
+
+        fingerprint = dataset_fingerprint(
+            holdout_ids
         )
 
         return {
             "accuracy": float(
                 accuracy_score(
                     y_holdout,
-                    predictions
+                    predictions,
                 )
             ),
 
@@ -578,13 +767,29 @@ def current_holdout_evaluation(
                 log_loss(
                     y_holdout,
                     probabilities,
-                    labels=[0, 1, 2]
+                    labels=[0, 1, 2],
                 )
             ),
 
             "brier": brier_multiclass(
                 y_holdout,
-                probabilities
+                probabilities,
+            ),
+
+            "evaluation_dataset_fingerprint": (
+                fingerprint
+            ),
+
+            "evaluation_protocol_version": (
+                MODEL_PROTOCOL_VERSION
+            ),
+
+            "evaluation_compatibility": (
+                compatibility
+            ),
+
+            "evaluation_holdout_matches": (
+                int(len(y_holdout))
             ),
         }
 
@@ -592,11 +797,90 @@ def current_holdout_evaluation(
 
         print(
             "No se pudo reevaluar el "
-            "activo en el holdout actual: "
+            "activo en el holdout común: "
             f"{exc}"
         )
 
         return None
+
+
+def split_dataset(
+    X: np.ndarray,
+    y: np.ndarray,
+    match_ids: list[int],
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[int],
+    str,
+    str,
+]:
+
+    train_end = int(
+        len(X) * TRAIN_RATIO
+    )
+
+    calibration_end = int(
+        len(X)
+        * (
+            TRAIN_RATIO
+            + CALIBRATION_RATIO
+        )
+    )
+
+    if (
+        train_end < 30
+        or calibration_end - train_end < 10
+        or len(X) - calibration_end < 10
+    ):
+
+        raise RuntimeError(
+            "El dataset no permite una "
+            "separación temporal 60/20/20 segura."
+        )
+
+    X_train = X[:train_end]
+    y_train = y[:train_end]
+
+    X_cal = X[
+        train_end:calibration_end
+    ]
+
+    y_cal = y[
+        train_end:calibration_end
+    ]
+
+    X_holdout = X[
+        calibration_end:
+    ]
+
+    y_holdout = y[
+        calibration_end:
+    ]
+
+    holdout_ids = match_ids[
+        calibration_end:
+    ]
+
+    fingerprint = dataset_fingerprint(
+        holdout_ids
+    )
+
+    return (
+        X_train,
+        y_train,
+        X_cal,
+        y_cal,
+        X_holdout,
+        y_holdout,
+        holdout_ids,
+        fingerprint,
+        str(len(X_holdout)),
+    )
 
 
 def save_candidate(
@@ -619,6 +903,10 @@ def save_candidate(
         )
     )
 
+    fingerprint = dataset_fingerprint(
+        holdout_ids
+    )
+
     active_current = None
 
     if active_row:
@@ -630,14 +918,15 @@ def save_candidate(
                     candidate_metrics[
                         "_X_holdout"
                     ],
-                    dtype=float
+                    dtype=float,
                 ),
                 np.asarray(
                     candidate_metrics[
                         "_y_holdout"
                     ],
-                    dtype=int
+                    dtype=int,
                 ),
+                holdout_ids,
             )
         )
 
@@ -657,7 +946,9 @@ def save_candidate(
 
             should_activate = True
 
-            reason = "first_nestor_model"
+            reason = (
+                "first_nestor_model"
+            )
 
         else:
 
@@ -667,49 +958,69 @@ def save_candidate(
 
     else:
 
-        improvement = float(
-            active_current["log_loss"]
-            - candidate_public[
-                "holdout_log_loss"
+        common_fingerprint = (
+            active_current[
+                "evaluation_dataset_fingerprint"
             ]
+            == fingerprint
         )
 
-        if improvement > ACTIVATION_MARGIN:
-
-            should_activate = True
+        if not common_fingerprint:
 
             reason = (
-                "improved_current_holdout_log_loss"
+                "evaluation_fingerprint_mismatch"
             )
 
         else:
 
-            reason = (
-                "not_better_than_active_on_same_holdout"
+            improvement = float(
+                active_current["log_loss"]
+                - candidate_public[
+                    "holdout_log_loss"
+                ]
             )
 
-    if should_activate:
+            candidate_public[
+                "log_loss_improvement_vs_active"
+            ] = improvement
 
-        supabase_patch(
-            "model_versions",
-            {
-                "active": "eq.true"
-            },
-            {
-                "active": False,
-                "status": "retired"
-            }
-        )
+            if improvement > ACTIVATION_MARGIN:
+
+                should_activate = True
+
+                reason = (
+                    "improved_current_holdout_log_loss"
+                )
+
+            else:
+
+                reason = (
+                    "not_better_than_active_on_same_holdout"
+                )
 
     artifact[
         "evaluation_dataset_fingerprint"
-    ] = dataset_fingerprint(
-        holdout_ids
-    )
+    ] = fingerprint
 
     artifact[
         "model_protocol_version"
     ] = MODEL_PROTOCOL_VERSION
+
+    # ------------------------------------------------------------
+    # IMPORTANTE:
+    # Primero guardamos el challenger.
+    # Así un fallo del INSERT no toca al modelo activo.
+    # ------------------------------------------------------------
+
+    initial_status = (
+        "promotion_pending"
+        if should_activate
+        else (
+            "rejected"
+            if active_current
+            else "challenger"
+        )
+    )
 
     row = {
 
@@ -739,25 +1050,20 @@ def save_candidate(
             ),
 
             "evaluation_dataset_fingerprint": (
-                artifact[
-                    "evaluation_dataset_fingerprint"
-                ]
+                fingerprint
+            ),
+
+            "feature_schema_version": (
+                FEATURE_SCHEMA_VERSION
             ),
         },
 
         "artifact": artifact,
 
-        "active": should_activate,
+        # Siempre nace inactivo.
+        "active": False,
 
-        "status": (
-            "active"
-            if should_activate
-            else (
-                "rejected"
-                if active_current
-                else "challenger"
-            )
-        ),
+        "status": initial_status,
 
         "parent_version": (
             active_row.get("version")
@@ -783,15 +1089,101 @@ def save_candidate(
                 MODEL_PROTOCOL_VERSION
             ),
 
+            "train_ratio": TRAIN_RATIO,
+
+            "calibration_ratio": CALIBRATION_RATIO,
+
+            "holdout_ratio": (
+                1.0
+                - TRAIN_RATIO
+                - CALIBRATION_RATIO
+            ),
+
             "activation_margin_log_loss": (
                 ACTIVATION_MARGIN
+            ),
+
+            "evaluation_dataset_fingerprint": (
+                fingerprint
             ),
         },
     }
 
-    supabase_post(
+    inserted = supabase_post(
         "model_versions",
-        row
+        row,
+    )
+
+    if not inserted:
+
+        raise RuntimeError(
+            "El challenger no pudo guardarse "
+            "en model_versions."
+        )
+
+    # ------------------------------------------------------------
+    # PROMOCIÓN CONTROLADA
+    # ------------------------------------------------------------
+
+    if should_activate:
+
+        # Retirar el campeón anterior.
+        supabase_patch(
+            "model_versions",
+            {
+                "active": "eq.true"
+            },
+            {
+                "active": False,
+                "status": "retired",
+            },
+        )
+
+        # Activar solamente el challenger recién guardado.
+        activated = supabase_patch(
+            "model_versions",
+            {
+                "version": f"eq.{version}"
+            },
+            {
+                "active": True,
+                "status": "active",
+            },
+        )
+
+        if not activated:
+
+            raise RuntimeError(
+                "El challenger fue guardado, "
+                "pero no pudo activarse."
+            )
+
+    else:
+
+        # Actualizar el estado final.
+        supabase_patch(
+            "model_versions",
+            {
+                "version": f"eq.{version}"
+            },
+            {
+                "active": False,
+                "status": (
+                    "rejected"
+                    if active_current
+                    else "challenger"
+                ),
+            },
+        )
+
+    final_status = (
+        "active"
+        if should_activate
+        else (
+            "rejected"
+            if active_current
+            else "challenger"
+        )
     )
 
     return {
@@ -800,7 +1192,7 @@ def save_candidate(
 
         "active": should_activate,
 
-        "status": row["status"],
+        "status": final_status,
 
         "activation_reason": reason,
 
@@ -817,9 +1209,11 @@ def save_candidate(
         ),
 
         "evaluation_dataset_fingerprint": (
-            artifact[
-                "evaluation_dataset_fingerprint"
-            ]
+            fingerprint
+        ),
+
+        "evaluation_protocol_version": (
+            MODEL_PROTOCOL_VERSION
         ),
     }
 
@@ -836,7 +1230,17 @@ def main() -> None:
     )
 
     print(
-        "Entrenamiento formal 1X2 v1.0"
+        "Entrenamiento formal 1X2 v1.1"
+    )
+
+    print(
+        "Protocolo:",
+        MODEL_PROTOCOL_VERSION,
+    )
+
+    print(
+        "Feature schema:",
+        FEATURE_SCHEMA_VERSION,
     )
 
     print(
@@ -876,53 +1280,50 @@ def main() -> None:
 
     X = np.asarray(
         X_list,
-        dtype=float
+        dtype=float,
     )
 
     y = np.asarray(
         y_list,
-        dtype=int
+        dtype=int,
     )
 
-    train_end = int(
-        len(X) * 0.60
+    (
+        X_train,
+        y_train,
+        X_cal,
+        y_cal,
+        X_holdout,
+        y_holdout,
+        holdout_ids,
+        evaluation_fingerprint,
+        holdout_size_text,
+    ) = split_dataset(
+        X,
+        y,
+        match_ids,
     )
 
-    calibration_end = int(
-        len(X) * 0.80
+    print(
+        "Split temporal:"
     )
 
-    if (
-        train_end < 30
-        or calibration_end - train_end < 10
-        or len(X) - calibration_end < 10
-    ):
+    print(
+        f"  Entrenamiento: {len(X_train)}"
+    )
 
-        raise RuntimeError(
-            "El dataset no permite una "
-            "separación temporal 60/20/20 segura."
-        )
+    print(
+        f"  Calibración:   {len(X_cal)}"
+    )
 
-    X_train = X[:train_end]
-    y_train = y[:train_end]
+    print(
+        f"  Holdout:       {len(X_holdout)}"
+    )
 
-    X_cal = X[
-        train_end:calibration_end
-    ]
-    y_cal = y[
-        train_end:calibration_end
-    ]
-
-    X_holdout = X[
-        calibration_end:
-    ]
-    y_holdout = y[
-        calibration_end:
-    ]
-
-    holdout_ids = match_ids[
-        calibration_end:
-    ]
+    print(
+        "  Fingerprint:   "
+        f"{evaluation_fingerprint}"
+    )
 
     scaler = StandardScaler()
 
@@ -947,7 +1348,7 @@ def main() -> None:
 
     model.fit(
         X_train_scaled,
-        y_train
+        y_train,
     )
 
     cal_logits = (
@@ -958,7 +1359,7 @@ def main() -> None:
 
     temperature = fit_temperature(
         cal_logits,
-        y_cal
+        y_cal,
     )
 
     holdout_logits = (
@@ -969,18 +1370,18 @@ def main() -> None:
 
     holdout_probabilities = softmax(
         holdout_logits,
-        temperature
+        temperature,
     )
 
     holdout_predictions = np.argmax(
         holdout_probabilities,
-        axis=1
+        axis=1,
     )
 
     accuracy = float(
         accuracy_score(
             y_holdout,
-            holdout_predictions
+            holdout_predictions,
         )
     )
 
@@ -988,25 +1389,25 @@ def main() -> None:
         log_loss(
             y_holdout,
             holdout_probabilities,
-            labels=[0, 1, 2]
+            labels=[0, 1, 2],
         )
     )
 
     brier = brier_multiclass(
         y_holdout,
-        holdout_probabilities
+        holdout_probabilities,
     )
 
     raw_holdout_probabilities = softmax(
         holdout_logits,
-        1.0
+        1.0,
     )
 
     raw_logloss = float(
         log_loss(
             y_holdout,
             raw_holdout_probabilities,
-            labels=[0, 1, 2]
+            labels=[0, 1, 2],
         )
     )
 
@@ -1027,6 +1428,19 @@ def main() -> None:
     )
 
     active_row = load_active_model()
+
+    if active_row:
+
+        print(
+            "Modelo activo detectado: "
+            f"{active_row.get('version')}"
+        )
+
+    else:
+
+        print(
+            "No existe modelo activo."
+        )
 
     candidate_metrics: dict[str, Any] = {
 
@@ -1070,6 +1484,14 @@ def main() -> None:
             len(matches) - len(X)
         ),
 
+        "evaluation_dataset_fingerprint": (
+            evaluation_fingerprint
+        ),
+
+        "evaluation_protocol_version": (
+            MODEL_PROTOCOL_VERSION
+        ),
+
         "_X_holdout": (
             X_holdout.tolist()
         ),
@@ -1086,12 +1508,12 @@ def main() -> None:
 
     validation_start = match_dates.get(
         int(holdout_ids[0]),
-        matches[0]["starting_at"]
+        matches[0]["starting_at"],
     )
 
     validation_end = match_dates.get(
         int(holdout_ids[-1]),
-        matches[-1]["starting_at"]
+        matches[-1]["starting_at"],
     )
 
     result = save_candidate(
@@ -1107,7 +1529,7 @@ def main() -> None:
         json.dumps(
             result,
             indent=2,
-            ensure_ascii=False
+            ensure_ascii=False,
         )
     )
 
