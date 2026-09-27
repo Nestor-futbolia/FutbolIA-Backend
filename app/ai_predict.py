@@ -1,273 +1,181 @@
-import os
+from __future__ import annotations
+
 import math
+import os
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
+from app.nestor_features import (
+    FEATURE_NAMES,
+    FEATURE_SCHEMA_VERSION,
+    build_inference_features,
+    target_name,
+)
 
-# ============================================================
-# CONFIGURACIÓN
-# ============================================================
 
-FEATURE_NAMES = [
-    "home_goals_for_5",
-    "home_goals_against_5",
-    "home_points_5",
-    "away_goals_for_5",
-    "away_goals_against_5",
-    "away_points_5",
-    "goals_form_difference",
-    "points_form_difference",
-    "home_advantage",
-]
+SUPABASE_URL = os.getenv(
+    "SUPABASE_URL",
+    ""
+).strip().rstrip("/")
 
-WINDOW = 5
+SUPABASE_SECRET_KEY = os.getenv(
+    "SUPABASE_SECRET_KEY",
+    ""
+).strip()
 
-FINISHED_STATUSES = {
-    "FT",
-    "AET",
-    "PEN",
+
+if not SUPABASE_URL:
+
+    raise RuntimeError(
+        "Falta SUPABASE_URL"
+    )
+
+
+if not SUPABASE_SECRET_KEY:
+
+    raise RuntimeError(
+        "Falta SUPABASE_SECRET_KEY"
+    )
+
+
+HEADERS = {
+
+    "apikey":
+        SUPABASE_SECRET_KEY,
+
+    "Authorization":
+        f"Bearer {SUPABASE_SECRET_KEY}",
+
+    "Content-Type":
+        "application/json",
 }
 
 
-# ============================================================
-# SUPABASE
-# ============================================================
+def supabase_url(
+    table: str
+) -> str:
 
-def get_supabase_config() -> tuple[str, str]:
-
-    url = os.getenv(
-        "SUPABASE_URL",
-        ""
-    ).strip().rstrip("/")
-
-    key = os.getenv(
-        "SUPABASE_SECRET_KEY",
-        ""
-    ).strip()
-
-    if not url:
-        raise RuntimeError(
-            "Falta SUPABASE_URL"
-        )
-
-    if not key:
-        raise RuntimeError(
-            "Falta SUPABASE_SECRET_KEY"
-        )
-
-    return url, key
-
-
-def supabase_headers() -> dict[str, str]:
-
-    _, key = get_supabase_config()
-
-    return {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
+    return (
+        f"{SUPABASE_URL}"
+        f"/rest/v1/{table}"
+    )
 
 
 async def supabase_get(
     table: str,
-    params: Optional[dict[str, Any]] = None,
-) -> list[dict]:
-
-    url, _ = get_supabase_config()
-
-    endpoint = (
-        f"{url}/rest/v1/{table}"
-    )
+    params: dict[str, Any]
+) -> list[dict[str, Any]]:
 
     async with httpx.AsyncClient(
         timeout=60
     ) as client:
 
         response = await client.get(
-            endpoint,
-            headers=supabase_headers(),
-            params=params or {},
+
+            supabase_url(table),
+
+            headers=HEADERS,
+
+            params=params
         )
 
-    if response.status_code >= 400:
+    if response.status_code not in (
+        200,
+        206
+    ):
 
         raise RuntimeError(
-            f"Supabase GET {table}: "
-            f"{response.status_code} "
+
+            f"Supabase GET {table} "
+            f"HTTP {response.status_code}: "
             f"{response.text}"
         )
 
-    try:
+    data = response.json()
 
-        data = response.json()
-
-    except Exception:
-
-        raise RuntimeError(
-            f"Supabase devolvió una respuesta "
-            f"no válida para {table}"
-        )
-
-    if isinstance(data, list):
-        return data
-
-    return []
+    return (
+        data
+        if isinstance(data, list)
+        else []
+    )
 
 
 async def supabase_post(
     table: str,
-    payload: Any,
-    prefer: str = (
-        "resolution=merge-duplicates,"
-        "return=representation"
-    ),
-) -> Any:
+    payload: dict[str, Any]
+) -> list[dict[str, Any]]:
 
-    url, _ = get_supabase_config()
+    headers = {
 
-    endpoint = (
-        f"{url}/rest/v1/{table}"
-    )
+        **HEADERS,
 
-    headers = supabase_headers()
-
-    headers["Prefer"] = prefer
+        "Prefer":
+            "return=representation"
+    }
 
     async with httpx.AsyncClient(
         timeout=60
     ) as client:
 
         response = await client.post(
-            endpoint,
+
+            supabase_url(table),
+
             headers=headers,
-            json=payload,
+
+            json=payload
         )
 
-    if response.status_code >= 400:
+    if response.status_code not in (
+        200,
+        201
+    ):
 
         raise RuntimeError(
-            f"Supabase POST {table}: "
-            f"{response.status_code} "
+
+            f"Supabase POST {table} "
+            f"HTTP {response.status_code}: "
             f"{response.text}"
         )
 
-    if not response.text:
-        return None
-
-    try:
-
-        return response.json()
-
-    except Exception:
-
-        return response.text
+    return (
+        response.json()
+        if response.text
+        else []
+    )
 
 
-# ============================================================
-# UTILIDADES
-# ============================================================
-
-def now_iso() -> str:
-
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
-
-
-def safe_float(
-    value: Any,
-    default: float = 0.0,
-) -> float:
-
-    try:
-
-        if value is None:
-            return default
-
-        return float(value)
-
-    except Exception:
-
-        return default
-
-
-def safe_int(
-    value: Any,
-    default: Optional[int] = None,
-) -> Optional[int]:
-
-    try:
-
-        if value is None:
-            return default
-
-        return int(value)
-
-    except Exception:
-
-        return default
-
-
-def normalize_status(
-    value: Any,
-) -> str:
-
-    if value is None:
-        return ""
-
-    return str(value).strip().upper()
-
-
-def normalize_class(
-    value: Any,
-) -> str:
-
-    text = str(value).strip().upper()
-
-    if text in {
-        "H",
-        "HOME",
-        "LOCAL",
-        "1",
-    }:
-        return "H"
-
-    if text in {
-        "D",
-        "DRAW",
-        "EMPATE",
-        "X",
-    }:
-        return "D"
-
-    if text in {
-        "A",
-        "AWAY",
-        "VISITOR",
-        "VISITANTE",
-        "2",
-    }:
-        return "A"
-
-    return text
-
-
-# ============================================================
-# MODELO
-# ============================================================
-
-async def load_active_model() -> dict:
+async def load_active_model() -> dict[str, Any]:
 
     rows = await supabase_get(
+
         "model_versions",
+
         {
-            "select": "*",
-            "active": "eq.true",
-            "order": "trained_at.desc",
-            "limit": "1",
+
+            "select": (
+                "version,"
+                "model_name,"
+                "trained_at,"
+                "training_matches,"
+                "metrics,"
+                "artifact,"
+                "active,"
+                "status,"
+                "parent_version,"
+                "feature_schema_version"
+            ),
+
+            "active":
+                "eq.true",
+
+            "order":
+                "trained_at.desc",
+
+            "limit":
+                "1",
         },
     )
 
@@ -275,993 +183,719 @@ async def load_active_model() -> dict:
 
         raise RuntimeError(
             "No existe un modelo activo "
-            "en model_versions"
+            "en model_versions."
         )
 
     row = rows[0]
 
-    metrics = row.get(
-        "metrics"
+    artifact = row.get(
+        "artifact"
     )
 
     if not isinstance(
-        metrics,
-        dict,
+        artifact,
+        dict
     ):
 
-        raise RuntimeError(
-            "El modelo activo no contiene "
-            "metrics válidos"
-        )
-
-    model = {
-        "version": row.get(
-            "version"
-        ),
-
-        "model_name": row.get(
-            "model_name"
-        ),
-
-        "trained_at": row.get(
-            "trained_at"
-        ),
-
-        "training_matches": row.get(
-            "training_matches"
-        ),
-
-        "metrics": metrics,
-    }
-
-    model_type = (
-        metrics.get(
-            "model_type"
-        )
-    )
-
-    if model_type is None:
-
-        model_type = (
-            "multinomial_logistic_regression"
-        )
-
-    if model_type not in {
-        "multinomial_logistic_regression",
-        "logistic_regression",
-    }:
-
-        raise RuntimeError(
-            "Tipo de modelo no compatible: "
-            f"{model_type}"
-        )
-
-    model["model_type"] = model_type
-
-    feature_names = metrics.get(
-        "feature_names"
-    )
-
-    if not feature_names:
-
-        feature_names = metrics.get(
-            "features"
-        )
-
-    if not feature_names:
-
-        feature_names = FEATURE_NAMES
-
-    model["feature_names"] = list(
-        feature_names
-    )
-
-    classes = metrics.get(
-        "classes",
-        ["H", "D", "A"],
-    )
-
-    model["classes"] = [
-        normalize_class(value)
-        for value in classes
-    ]
-
-    coefficients = metrics.get(
-        "coefficients"
-    )
-
-    intercept = metrics.get(
-        "intercept"
-    )
-
-    if coefficients is None:
-
-        coefficients = metrics.get(
-            "coef"
-        )
-
-    if intercept is None:
-
-        intercept = metrics.get(
-            "intercepts"
-        )
-
-    if coefficients is None:
-
-        raise RuntimeError(
-            "El modelo activo no contiene "
-            "coefficients"
-        )
-
-    if intercept is None:
-
-        raise RuntimeError(
-            "El modelo activo no contiene "
-            "intercept"
-        )
-
-    model["coefficients"] = coefficients
-    model["intercept"] = intercept
-
-    scaler_mean = metrics.get(
-        "scaler_mean"
-    )
-
-    scaler_scale = metrics.get(
-        "scaler_scale"
-    )
-
-    if scaler_mean is None:
-
-        scaler_mean = [
-            0.0
-            for _ in model[
-                "feature_names"
-            ]
-        ]
-
-    if scaler_scale is None:
-
-        scaler_scale = [
-            1.0
-            for _ in model[
-                "feature_names"
-            ]
-        ]
-
-    model["scaler_mean"] = scaler_mean
-    model["scaler_scale"] = scaler_scale
-
-    return model
-
-
-# ============================================================
-# PARTIDO
-# ============================================================
-
-async def get_match(
-    match_id: int,
-) -> dict:
-
-    rows = await supabase_get(
-        "matches",
-        {
-            "select": "*",
-            "id": f"eq.{match_id}",
-            "limit": "1",
-        },
-    )
-
-    if not rows:
-
-        raise RuntimeError(
-            f"No existe el partido {match_id} "
-            f"en la tabla matches de Supabase"
-        )
-
-    return rows[0]
-
-
-# ============================================================
-# HISTORIAL
-# ============================================================
-
-async def get_previous_matches(
-    before_date: Optional[str],
-    limit: int = 1000,
-) -> list[dict]:
-
-    params = {
-        "select": (
-            "id,"
-            "starting_at,"
-            "status,"
-            "home_team_id,"
-            "away_team_id,"
-            "home_goals,"
-            "away_goals"
-        ),
-        "status": (
-            "in.(FT,AET,PEN)"
-        ),
-        "order": (
-            "starting_at.asc"
-        ),
-        "limit": str(limit),
-    }
-
-    if before_date:
-
-        params[
-            "starting_at"
-        ] = f"lt.{before_date}"
-
-    return await supabase_get(
-        "matches",
-        params,
-    )
-
-
-def team_form(
-    matches: list[dict],
-    team_id: int,
-) -> dict:
-
-    history = []
-
-    for match in matches:
-
-        home_id = safe_int(
-            match.get(
-                "home_team_id"
-            )
-        )
-
-        away_id = safe_int(
-            match.get(
-                "away_team_id"
-            )
+        metrics = row.get(
+            "metrics"
         )
 
         if (
-            home_id != team_id
-            and away_id != team_id
+            isinstance(metrics, dict)
+            and "coefficients" in metrics
         ):
-            continue
 
-        home_goals = safe_int(
-            match.get(
-                "home_goals"
-            ),
-            0,
-        )
-
-        away_goals = safe_int(
-            match.get(
-                "away_goals"
-            ),
-            0,
-        )
-
-        if home_goals is None:
-            home_goals = 0
-
-        if away_goals is None:
-            away_goals = 0
-
-        if home_id == team_id:
-
-            goals_for = home_goals
-            goals_against = away_goals
+            artifact = metrics
 
         else:
 
-            goals_for = away_goals
-            goals_against = home_goals
+            artifact = None
 
-        if goals_for > goals_against:
-
-            points = 3
-
-        elif goals_for == goals_against:
-
-            points = 1
-
-        else:
-
-            points = 0
-
-        history.append({
-            "goals_for": goals_for,
-            "goals_against": goals_against,
-            "points": points,
-        })
-
-    recent = history[-WINDOW:]
-
-    if not recent:
-
-        return {
-            "goals_for": 0.0,
-            "goals_against": 0.0,
-            "points": 0.0,
-            "matches": 0,
-        }
-
-    return {
-        "goals_for": sum(
-            item["goals_for"]
-            for item in recent
-        ) / len(recent),
-
-        "goals_against": sum(
-            item["goals_against"]
-            for item in recent
-        ) / len(recent),
-
-        "points": sum(
-            item["points"]
-            for item in recent
-        ),
-
-        "matches": len(recent),
-    }
-
-
-# ============================================================
-# CARACTERÍSTICAS
-# ============================================================
-
-async def build_features(
-    match: dict,
-) -> list[float]:
-
-    match_id = safe_int(
-        match.get(
-            "id"
-        )
-    )
-
-    home_team_id = safe_int(
-        match.get(
-            "home_team_id"
-        )
-    )
-
-    away_team_id = safe_int(
-        match.get(
-            "away_team_id"
-        )
-    )
-
-    if home_team_id is None:
-
-        raise RuntimeError(
-            f"El partido {match_id} "
-            f"no tiene home_team_id"
-        )
-
-    if away_team_id is None:
-
-        raise RuntimeError(
-            f"El partido {match_id} "
-            f"no tiene away_team_id"
-        )
-
-    starting_at = match.get(
-        "starting_at"
-    )
-
-    previous_matches = (
-        await get_previous_matches(
-            before_date=starting_at
-        )
-    )
-
-    home_form = team_form(
-        previous_matches,
-        home_team_id,
-    )
-
-    away_form = team_form(
-        previous_matches,
-        away_team_id,
-    )
-
-    goals_form_difference = (
-        (
-            home_form["goals_for"]
-            - home_form["goals_against"]
-        )
-        -
-        (
-            away_form["goals_for"]
-            - away_form["goals_against"]
-        )
-    )
-
-    points_form_difference = (
-        home_form["points"]
-        - away_form["points"]
-    )
-
-    features = {
-
-        "home_goals_for_5":
-            home_form["goals_for"],
-
-        "home_goals_against_5":
-            home_form["goals_against"],
-
-        "home_points_5":
-            home_form["points"],
-
-        "away_goals_for_5":
-            away_form["goals_for"],
-
-        "away_goals_against_5":
-            away_form["goals_against"],
-
-        "away_points_5":
-            away_form["points"],
-
-        "goals_form_difference":
-            goals_form_difference,
-
-        "points_form_difference":
-            points_form_difference,
-
-        "home_advantage":
-            1.0,
-    }
-
-    return [
-        safe_float(
-            features.get(
-                name,
-                0.0
-            )
-        )
-        for name in FEATURE_NAMES
-    ]
-
-
-# ============================================================
-# ESCALADO
-# ============================================================
-
-def scale_features(
-    values: list[float],
-    model: dict,
-) -> list[float]:
-
-    means = model.get(
-        "scaler_mean",
-        [],
-    )
-
-    scales = model.get(
-        "scaler_scale",
-        [],
-    )
-
-    result = []
-
-    for index, value in enumerate(
-        values
+    if not isinstance(
+        artifact,
+        dict
     ):
 
-        mean = 0.0
-
-        scale = 1.0
-
-        if index < len(means):
-
-            mean = safe_float(
-                means[index],
-                0.0,
-            )
-
-        if index < len(scales):
-
-            scale = safe_float(
-                scales[index],
-                1.0,
-            )
-
-        if abs(scale) < 1e-12:
-
-            scale = 1.0
-
-        result.append(
-            (
-                safe_float(
-                    value
-                )
-                - mean
-            )
-            / scale
+        raise RuntimeError(
+            "El modelo activo no contiene "
+            "un artefacto compatible."
         )
 
-    return result
+    row["artifact"] = artifact
+
+    return row
 
 
-# ============================================================
-# SIGMOIDE / SOFTMAX
-# ============================================================
-
-def sigmoid(
-    value: float,
-) -> float:
-
-    value = max(
-        -60.0,
-        min(
-            60.0,
-            value
-        )
-    )
-
-    return 1.0 / (
-        1.0 + math.exp(-value)
-    )
-
-
-def softmax(
-    values: list[float],
+def _softmax(
+    logits: list[float],
+    temperature: float = 1.0
 ) -> list[float]:
 
-    if not values:
-
-        return []
-
-    maximum = max(
-        values
+    t = max(
+        float(temperature),
+        0.05
     )
 
-    exponentials = [
-        math.exp(
-            max(
-                -60.0,
-                min(
-                    60.0,
-                    value - maximum
-                )
-            )
-        )
-        for value in values
+    z = [
+        value / t
+        for value in logits
     ]
 
-    total = sum(
-        exponentials
-    )
+    max_z = max(z)
 
-    if total <= 0:
+    exps = [
 
-        equal = 1.0 / len(
-            exponentials
+        math.exp(
+            value - max_z
         )
 
-        return [
-            equal
-            for _ in exponentials
-        ]
+        for value in z
+    ]
+
+    total = sum(exps)
 
     return [
+
         value / total
-        for value in exponentials
+
+        for value in exps
     ]
 
 
-# ============================================================
-# PREDICCIÓN DEL MODELO
-# ============================================================
+def _artifact_probabilities(
+    artifact: dict[str, Any],
+    features: list[float]
+) -> list[float]:
 
-def calculate_probabilities(
-    values: list[float],
-    model: dict,
-) -> dict[str, float]:
-
-    scaled = scale_features(
-        values,
-        model,
-    )
-
-    coefficients = model.get(
+    coefficients = artifact.get(
         "coefficients"
     )
 
-    intercept = model.get(
+    intercept = artifact.get(
         "intercept"
     )
 
-    classes = model.get(
-        "classes",
-        ["H", "D", "A"],
+    mean = artifact.get(
+        "scaler_mean"
     )
 
-    if not isinstance(
-        coefficients,
-        list,
+    scale = artifact.get(
+        "scaler_scale"
+    )
+
+    if not all(
+        isinstance(
+            value,
+            list
+        )
+
+        for value in (
+            coefficients,
+            intercept,
+            mean,
+            scale
+        )
     ):
 
         raise RuntimeError(
-            "coefficients no es una lista"
+            "Artefacto de modelo incompleto."
         )
 
-    if not isinstance(
-        intercept,
-        list,
-    ):
+    logits: list[float] = []
 
-        intercept = [
-            intercept
-        ]
+    for class_index in range(3):
 
-    # --------------------------------------------------------
-    # Caso multinomial
-    # --------------------------------------------------------
+        value = float(
+            intercept[class_index]
+        )
 
-    if len(coefficients) > 1:
-
-        scores = []
-
-        for class_index, class_coef in enumerate(
-            coefficients
+        for feature_index, feature_value in enumerate(
+            features
         ):
 
-            bias = 0.0
+            denominator = float(
+                scale[feature_index]
+            )
 
-            if class_index < len(
-                intercept
-            ):
+            if abs(
+                denominator
+            ) < 1e-12:
 
-                bias = safe_float(
-                    intercept[class_index]
+                denominator = 1.0
+
+            standardized = (
+
+                float(feature_value)
+
+                - float(
+                    mean[feature_index]
                 )
 
-            score = bias
+            ) / denominator
 
-            if isinstance(
-                class_coef,
-                list,
-            ):
+            value += (
 
-                for index, value in enumerate(
-                    scaled
-                ):
+                standardized
 
-                    if index < len(
-                        class_coef
-                    ):
-
-                        score += (
-                            safe_float(
-                                class_coef[index]
-                            )
-                            * value
-                        )
-
-            scores.append(
-                score
+                * float(
+                    coefficients[
+                        class_index
+                    ][feature_index]
+                )
             )
 
-        probabilities = softmax(
-            scores
+        logits.append(
+            value
         )
 
-        result = {
-            "H": 0.0,
-            "D": 0.0,
-            "A": 0.0,
-        }
-
-        for index, probability in enumerate(
-            probabilities
-        ):
-
-            if index >= len(
-                classes
-            ):
-                continue
-
-            class_name = normalize_class(
-                classes[index]
-            )
-
-            if class_name in result:
-
-                result[
-                    class_name
-                ] = probability
-
-        return result
-
-    # --------------------------------------------------------
-    # Caso binario / fallback
-    # --------------------------------------------------------
-
-    class_coef = (
-        coefficients[0]
-        if coefficients
-        else []
+    calibration = artifact.get(
+        "calibration",
+        {}
     )
-
-    bias = safe_float(
-        intercept[0]
-        if intercept
-        else 0.0
-    )
-
-    score = bias
 
     if isinstance(
-        class_coef,
-        list,
+        calibration,
+        dict
     ):
 
-        for index, value in enumerate(
-            scaled
-        ):
-
-            if index < len(
-                class_coef
-            ):
-
-                score += (
-                    safe_float(
-                        class_coef[index]
-                    )
-                    * value
-                )
-
-    probability = sigmoid(
-        score
-    )
-
-    # Si el modelo binario no permite
-    # representar 3 clases, usamos un
-    # fallback neutro para no inventar
-    # una tercera clase.
-
-    return {
-        "H": probability,
-        "D": 0.0,
-        "A": 1.0 - probability,
-    }
-
-
-# ============================================================
-# PREDICCIÓN PRINCIPAL
-# ============================================================
-
-async def predict_match(
-    match_id: int,
-) -> dict:
-
-    # --------------------------------------------------------
-    # 1. Buscar partido
-    # --------------------------------------------------------
-
-    match = await get_match(
-        match_id
-    )
-
-    # --------------------------------------------------------
-    # 2. Cargar modelo
-    # --------------------------------------------------------
-
-    model = await load_active_model()
-
-    # --------------------------------------------------------
-    # 3. Estado del partido
-    # --------------------------------------------------------
-
-    status = normalize_status(
-        match.get(
-            "status"
+        temperature = float(
+            calibration.get(
+                "temperature",
+                1.0
+            )
         )
-    )
-
-    # No permitimos predecir como
-    # futuro un partido que ya terminó.
-    #
-    # Para pruebas técnicas sí podemos
-    # calcular la predicción histórica,
-    # pero la marcamos como histórica.
-
-    historical = (
-        status in FINISHED_STATUSES
-    )
-
-    # --------------------------------------------------------
-    # 4. Crear características
-    # --------------------------------------------------------
-
-    feature_values = (
-        await build_features(
-            match
-        )
-    )
-
-    # --------------------------------------------------------
-    # 5. Calcular probabilidades
-    # --------------------------------------------------------
-
-    probabilities = (
-        calculate_probabilities(
-            feature_values,
-            model,
-        )
-    )
-
-    home_probability = (
-        probabilities["H"]
-    )
-
-    draw_probability = (
-        probabilities["D"]
-    )
-
-    away_probability = (
-        probabilities["A"]
-    )
-
-    # --------------------------------------------------------
-    # 6. Normalizar por seguridad
-    # --------------------------------------------------------
-
-    total = (
-        home_probability
-        + draw_probability
-        + away_probability
-    )
-
-    if total <= 0:
-
-        home_probability = 1.0 / 3.0
-        draw_probability = 1.0 / 3.0
-        away_probability = 1.0 / 3.0
 
     else:
 
-        home_probability /= total
-        draw_probability /= total
-        away_probability /= total
+        temperature = 1.0
 
-    # --------------------------------------------------------
-    # 7. Selección principal
-    # --------------------------------------------------------
-
-    probability_map = {
-        "HOME": home_probability,
-        "DRAW": draw_probability,
-        "AWAY": away_probability,
-    }
-
-    predicted_selection = max(
-        probability_map,
-        key=probability_map.get,
+    return _softmax(
+        logits,
+        temperature
     )
 
-    predicted_probability = (
-        probability_map[
-            predicted_selection
+
+def _entropy(
+    probabilities: list[float]
+) -> float:
+
+    entropy = 0.0
+
+    for value in probabilities:
+
+        if value > 0:
+
+            entropy -= (
+                value
+                * math.log(value)
+            )
+
+    return float(
+        entropy
+        / math.log(
+            len(probabilities)
+        )
+    )
+
+
+def _explanation(
+    probabilities: list[float],
+    snapshot: dict[str, Any]
+) -> dict[str, Any]:
+
+    labels = [
+        "Local",
+        "Empate",
+        "Visitante"
+    ]
+
+    best_index = max(
+        range(3),
+        key=lambda i:
+            probabilities[i]
+    )
+
+    confidence = probabilities[
+        best_index
+    ]
+
+    entropy = _entropy(
+        probabilities
+    )
+
+    factors: list[str] = []
+
+    features = snapshot.get(
+        "features",
+        {}
+    )
+
+    if float(
+        features.get(
+            "points_form_difference",
+            0.0
+        )
+    ) > 0.15:
+
+        factors.append(
+            "La forma reciente de puntos "
+            "favorece al local."
+        )
+
+    elif float(
+        features.get(
+            "points_form_difference",
+            0.0
+        )
+    ) < -0.15:
+
+        factors.append(
+            "La forma reciente de puntos "
+            "favorece al visitante."
+        )
+
+    if float(
+        features.get(
+            "goals_form_difference",
+            0.0
+        )
+    ) > 0.20:
+
+        factors.append(
+            "El balance reciente de goles "
+            "favorece al local."
+        )
+
+    elif float(
+        features.get(
+            "goals_form_difference",
+            0.0
+        )
+    ) < -0.20:
+
+        factors.append(
+            "El balance reciente de goles "
+            "favorece al visitante."
+        )
+
+    if (
+        snapshot.get("imputed_home")
+        or snapshot.get("imputed_away")
+    ):
+
+        factors.append(
+
+            "Hay datos históricos "
+            "insuficientes para al menos "
+            "uno de los equipos; se aplicó "
+            "imputación del modelo."
+        )
+
+    if not factors:
+
+        factors.append(
+
+            "La salida combina forma "
+            "reciente y ventaja de local "
+            "según el modelo 1X2."
+        )
+
+    if entropy >= 0.85:
+
+        uncertainty = "alta"
+
+    elif entropy >= 0.60:
+
+        uncertainty = "media"
+
+    else:
+
+        uncertainty = "baja"
+
+    return {
+
+        "selection":
+            labels[best_index],
+
+        "confidence":
+            round(
+                confidence,
+                6
+            ),
+
+        "uncertainty":
+            uncertainty,
+
+        "entropy_normalized":
+            round(
+                entropy,
+                6
+            ),
+
+        "factors":
+            factors,
+    }
+
+
+async def _team_history(
+    team_id: int,
+    before: str
+) -> list[dict[str, Any]]:
+
+    rows = await supabase_get(
+
+        "matches",
+
+        {
+
+            "select": (
+                "id,"
+                "starting_at,"
+                "status,"
+                "home_team_id,"
+                "away_team_id,"
+                "home_goals,"
+                "away_goals"
+            ),
+
+            "or":
+                (
+                    f"(home_team_id.eq.{team_id},"
+                    f"away_team_id.eq.{team_id})"
+                ),
+
+            "status":
+                "in.(FT,AET,PEN)",
+
+            "starting_at":
+                f"lt.{before}",
+
+            "order":
+                "starting_at.desc,id.desc",
+
+            "limit":
+                "20",
+        },
+    )
+
+    normalized: list[
+        dict[str, Any]
+    ] = []
+
+    for row in rows:
+
+        normalized.append(
+            {
+                **row,
+                "team_id":
+                    team_id
+            }
+        )
+
+    return normalized
+
+
+async def _existing_predictions(
+    match_id: int,
+    model_version: str
+) -> list[dict[str, Any]]:
+
+    return await supabase_get(
+
+        "predictions",
+
+        {
+
+            "select":
+                "*",
+
+            "match_id":
+                f"eq.{match_id}",
+
+            "model_version":
+                f"eq.{model_version}",
+
+            "market":
+                "eq.1X2",
+
+            "order":
+                "selection.asc",
+        }
+    )
+
+
+async def predict_match(
+    match_id: int
+) -> dict[str, Any]:
+
+    model_row = (
+        await load_active_model()
+    )
+
+    artifact = model_row[
+        "artifact"
+    ]
+
+    if artifact.get(
+        "model_family"
+    ) not in (
+        None,
+        "1X2"
+    ):
+
+        raise RuntimeError(
+
+            "El modelo activo no "
+            "pertenece a la familia 1X2."
+        )
+
+    matches = await supabase_get(
+
+        "matches",
+
+        {
+
+            "select": (
+                "id,"
+                "starting_at,"
+                "status,"
+                "home_team_id,"
+                "away_team_id,"
+                "home_goals,"
+                "away_goals,"
+                "league_id,"
+                "season_id"
+            ),
+
+            "id":
+                f"eq.{match_id}",
+
+            "limit":
+                "1",
+        }
+    )
+
+    if not matches:
+
+        raise RuntimeError(
+
+            f"No se encontró "
+            f"el partido {match_id}."
+        )
+
+    match = matches[0]
+
+    home_id = int(
+        match[
+            "home_team_id"
         ]
     )
 
-    # --------------------------------------------------------
-    # 8. Guardar predicciones
-    # --------------------------------------------------------
-
-    model_version = model.get(
-        "version"
+    away_id = int(
+        match[
+            "away_team_id"
+        ]
     )
 
-    if not model_version:
+    kickoff = str(
+        match[
+            "starting_at"
+        ]
+    )
 
-        raise RuntimeError(
-            "El modelo activo no tiene versión"
+    home_history = (
+        await _team_history(
+            home_id,
+            kickoff
+        )
+    )
+
+    away_history = (
+        await _team_history(
+            away_id,
+            kickoff
+        )
+    )
+
+    defaults = artifact.get(
+        "feature_defaults",
+        {}
+    )
+
+    if not isinstance(
+        defaults,
+        dict
+    ):
+
+        defaults = {}
+
+    features, snapshot = (
+        build_inference_features(
+            home_history,
+            away_history,
+            defaults
+        )
+    )
+
+    probabilities = (
+        _artifact_probabilities(
+            artifact,
+            features
+        )
+    )
+
+    explanation = (
+        _explanation(
+            probabilities,
+            snapshot
+        )
+    )
+
+    existing = (
+        await _existing_predictions(
+            match_id,
+            str(
+                model_row["version"]
+            )
+        )
+    )
+
+    if len(existing) >= 3:
+
+        selected = max(
+
+            existing,
+
+            key=lambda row:
+                float(
+                    row.get(
+                        "probability",
+                        0.0
+                    )
+                )
         )
 
-    features_snapshot = {
+        return {
 
-        "feature_names":
-            FEATURE_NAMES,
-
-        "feature_values":
-            feature_values,
-
-        "historical":
-            historical,
-
-        "match_status":
-            status,
-    }
-
-    saved_predictions = []
-
-    selections = [
-        (
-            "HOME",
-            home_probability
-        ),
-        (
-            "DRAW",
-            draw_probability
-        ),
-        (
-            "AWAY",
-            away_probability
-        ),
-    ]
-
-    for selection, probability in selections:
-
-        payload = {
+            "ok":
+                True,
 
             "match_id":
                 match_id,
 
             "model_version":
-                model_version,
+                model_row["version"],
 
             "market":
                 "1X2",
 
-            "selection":
-                selection,
+            "prediction":
+                selected.get(
+                    "selection"
+                ),
 
             "probability":
-                float(probability),
+                float(
+                    selected.get(
+                        "probability"
+                    )
+                ),
 
-            "predicted_at":
-                now_iso(),
+            "probabilities": {
 
-            "features_snapshot":
-                features_snapshot,
+                row.get(
+                    "selection"
+                ):
+                    float(
+                        row.get(
+                            "probability"
+                        )
+                    )
+
+                for row in existing
+
+                if row.get(
+                    "selection"
+                ) is not None
+            },
+
+            "features":
+                snapshot,
+
+            "explanation":
+                explanation,
+
+            "cached":
+                True,
         }
 
-        try:
+    labels = {
 
-            result = await supabase_post(
-                "predictions",
-                payload,
-            )
+        0: "HOME",
 
-            saved_predictions.append({
+        1: "DRAW",
+
+        2: "AWAY",
+    }
+
+    timestamp = (
+        datetime.now(
+            timezone.utc
+        ).isoformat()
+    )
+
+    for index in range(3):
+
+        await supabase_post(
+
+            "predictions",
+
+            {
+
+                "match_id":
+                    match_id,
+
+                "model_version":
+                    model_row["version"],
+
+                "market":
+                    "1X2",
+
                 "selection":
-                    selection,
+                    labels[index],
 
                 "probability":
-                    probability,
+                    float(
+                        probabilities[index]
+                    ),
 
-                "saved":
-                    True,
+                "created_at":
+                    timestamp,
 
-                "result":
-                    result,
-            })
+                "features_snapshot": {
 
-        except Exception as exc:
+                    **snapshot,
 
-            saved_predictions.append({
-                "selection":
-                    selection,
+                    "model_version":
+                        model_row["version"],
 
-                "probability":
-                    probability,
+                    "feature_schema_version":
+                        artifact.get(
+                            "feature_schema_version",
+                            FEATURE_SCHEMA_VERSION
+                        ),
+                },
+            },
+        )
 
-                "saved":
-                    False,
-
-                "error":
-                    str(exc),
-            })
-
-    # --------------------------------------------------------
-    # 9. Respuesta
-    # --------------------------------------------------------
+    best_index = int(
+        max(
+            range(3),
+            key=lambda i:
+                probabilities[i]
+        )
+    )
 
     return {
 
@@ -1271,107 +905,48 @@ async def predict_match(
         "match_id":
             match_id,
 
-        "historical":
-            historical,
-
-        "match_status":
-            status,
-
-        "home_team_id":
-            match.get(
-                "home_team_id"
-            ),
-
-        "away_team_id":
-            match.get(
-                "away_team_id"
-            ),
-
         "model_version":
-            model_version,
+            model_row["version"],
 
-        "model_name":
-            model.get(
-                "model_name"
+        "market":
+            "1X2",
+
+        "prediction":
+            target_name(
+                best_index
+            ),
+
+        "probability":
+            float(
+                probabilities[
+                    best_index
+                ]
             ),
 
         "probabilities": {
 
-            "home":
-                round(
-                    home_probability,
-                    6
+            "HOME":
+                float(
+                    probabilities[0]
                 ),
 
-            "draw":
-                round(
-                    draw_probability,
-                    6
+            "DRAW":
+                float(
+                    probabilities[1]
                 ),
 
-            "away":
-                round(
-                    away_probability,
-                    6
+            "AWAY":
+                float(
+                    probabilities[2]
                 ),
         },
-
-        "percentages": {
-
-            "home":
-                round(
-                    home_probability
-                    * 100,
-                    2
-                ),
-
-            "draw":
-                round(
-                    draw_probability
-                    * 100,
-                    2
-                ),
-
-            "away":
-                round(
-                    away_probability
-                    * 100,
-                    2
-                ),
-        },
-
-        "prediction":
-            predicted_selection,
-
-        "prediction_probability":
-            round(
-                predicted_probability,
-                6
-            ),
-
-        "prediction_percentage":
-            round(
-                predicted_probability
-                * 100,
-                2
-            ),
 
         "features":
-            {
-                FEATURE_NAMES[index]:
-                    feature_values[index]
-                for index in range(
-                    min(
-                        len(
-                            FEATURE_NAMES
-                        ),
-                        len(
-                            feature_values
-                        ),
-                    )
-                )
-            },
+            snapshot,
 
-        "saved_predictions":
-            saved_predictions,
+        "explanation":
+            explanation,
+
+        "cached":
+            False,
     }
