@@ -1,6 +1,8 @@
 import json
+import math
 import os
 import sys
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -15,19 +17,19 @@ from sklearn.preprocessing import StandardScaler
 # CONFIGURACIÓN
 # ============================================================
 
-MODEL_NAME = "FutbolIA-1X2-LogisticRegression"
+SUPABASE_PAGE_SIZE = 1000
+FORM_MATCHES = 5
 
-LOOKBACK_MATCHES = 5
-
-# Porcentaje temporal para validación.
-# Nunca mezclamos partidos futuros con partidos pasados.
-TRAIN_RATIO = 0.80
-
-FINISHED_STATUSES = {
+VALID_STATUSES = {
     "FT",
     "AET",
     "PEN",
 }
+
+MODEL_NAME = "FutbolIA-1X2-LogisticRegression"
+
+RANDOM_STATE = 42
+
 
 FEATURE_NAMES = [
     "home_goals_for_5",
@@ -46,22 +48,45 @@ FEATURE_NAMES = [
 # VARIABLES DE ENTORNO
 # ============================================================
 
-def get_required_env(name: str) -> str:
+def required_env(name: str) -> str:
     value = os.getenv(name)
 
     if not value:
         raise RuntimeError(
-            f"No existe la variable de entorno requerida: {name}"
+            f"Falta la variable de entorno {name}."
         )
 
     return value.strip()
 
 
 def get_supabase_config() -> tuple[str, str]:
-    url = get_required_env("SUPABASE_URL").rstrip("/")
-    key = get_required_env("SUPABASE_SECRET_KEY")
+    url = required_env(
+        "SUPABASE_URL"
+    ).rstrip("/")
+
+    key = required_env(
+        "SUPABASE_SECRET_KEY"
+    )
 
     return url, key
+
+
+def supabase_headers(
+    key: str,
+    extra: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
+
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    if extra:
+        headers.update(extra)
+
+    return headers
 
 
 # ============================================================
@@ -69,781 +94,602 @@ def get_supabase_config() -> tuple[str, str]:
 # ============================================================
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
-def safe_int(
+def as_float(
     value: Any,
-    default: Optional[int] = None,
-) -> Optional[int]:
+    default: float = 0.0,
+) -> float:
+
     try:
         if value is None:
             return default
+
+        number = float(value)
+
+        if not math.isfinite(number):
+            return default
+
+        return number
+
+    except (TypeError, ValueError):
+        return default
+
+
+def as_int(
+    value: Any,
+) -> Optional[int]:
+
+    try:
+        if value is None:
+            return None
 
         return int(value)
 
     except (TypeError, ValueError):
-        return default
+        return None
 
 
-def safe_float(
+def parse_date(
     value: Any,
-    default: Optional[float] = None,
-) -> Optional[float]:
-    try:
-        if value is None:
-            return default
+) -> Optional[datetime]:
 
-        return float(value)
-
-    except (TypeError, ValueError):
-        return default
-
-
-def clean_text(value: Any) -> Optional[str]:
-    if value is None:
+    if not value:
         return None
 
     text = str(value).strip()
 
-    if not text:
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    try:
+        dt = datetime.fromisoformat(text)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        return dt.astimezone(
+            timezone.utc
+        )
+
+    except ValueError:
         return None
 
-    return text
-
-
-def is_finished_status(value: Any) -> bool:
-    status = clean_text(value)
-
-    if not status:
-        return False
-
-    return status.upper() in FINISHED_STATUSES
-
 
 # ============================================================
-# SUPABASE
+# RESULTADO DEL PARTIDO
 # ============================================================
 
-def supabase_headers() -> dict[str, str]:
-    _, key = get_supabase_config()
+def match_result(
+    row: dict[str, Any],
+) -> Optional[str]:
 
-    return {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
-
-
-def supabase_get(
-    table: str,
-    params: Optional[dict[str, Any]] = None,
-) -> list[dict[str, Any]]:
-
-    supabase_url, _ = get_supabase_config()
-
-    url = f"{supabase_url}/rest/v1/{table}"
-
-    request_params = params or {}
-
-    try:
-        with httpx.Client(timeout=60) as client:
-            response = client.get(
-                url,
-                headers=supabase_headers(),
-                params=request_params,
-            )
-
-    except Exception as exc:
-        raise RuntimeError(
-            f"Error de conexión con Supabase en "
-            f"{table}: {exc}"
-        ) from exc
-
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"Supabase GET {table}: "
-            f"HTTP {response.status_code}: "
-            f"{response.text}"
-        )
-
-    try:
-        data = response.json()
-
-    except Exception as exc:
-        raise RuntimeError(
-            f"Supabase devolvió JSON inválido "
-            f"para {table}."
-        ) from exc
-
-    if not isinstance(data, list):
-        raise RuntimeError(
-            f"Supabase devolvió un formato inesperado "
-            f"para {table}."
-        )
-
-    return data
-
-
-def supabase_upsert(
-    table: str,
-    payload: dict[str, Any],
-    on_conflict: Optional[str] = None,
-) -> dict[str, Any]:
-
-    supabase_url, _ = get_supabase_config()
-
-    url = f"{supabase_url}/rest/v1/{table}"
-
-    headers = supabase_headers()
-
-    headers["Prefer"] = (
-        "resolution=merge-duplicates,return=representation"
+    home_goals = as_int(
+        row.get("home_goals")
     )
 
-    params = {}
+    away_goals = as_int(
+        row.get("away_goals")
+    )
 
-    if on_conflict:
-        params["on_conflict"] = on_conflict
+    if (
+        home_goals is None
+        or away_goals is None
+    ):
+        return None
 
-    try:
-        with httpx.Client(timeout=60) as client:
-            response = client.post(
-                url,
-                headers=headers,
-                params=params,
-                json=payload,
-            )
+    if home_goals > away_goals:
+        return "H"
 
-    except Exception as exc:
-        raise RuntimeError(
-            f"Error de conexión con Supabase "
-            f"al guardar en {table}: {exc}"
-        ) from exc
+    if home_goals < away_goals:
+        return "A"
 
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"Supabase UPSERT {table}: "
-            f"HTTP {response.status_code}: "
-            f"{response.text}"
-        )
-
-    try:
-        data = response.json()
-
-    except Exception:
-        data = {}
-
-    if isinstance(data, list) and data:
-        return data[0]
-
-    if isinstance(data, dict):
-        return data
-
-    return {}
-
-
-def supabase_patch(
-    table: str,
-    filters: dict[str, str],
-    payload: dict[str, Any],
-) -> list[dict[str, Any]]:
-
-    supabase_url, _ = get_supabase_config()
-
-    url = f"{supabase_url}/rest/v1/{table}"
-
-    headers = supabase_headers()
-
-    headers["Prefer"] = "return=representation"
-
-    params = dict(filters)
-
-    try:
-        with httpx.Client(timeout=60) as client:
-            response = client.patch(
-                url,
-                headers=headers,
-                params=params,
-                json=payload,
-            )
-
-    except Exception as exc:
-        raise RuntimeError(
-            f"Error de conexión con Supabase "
-            f"al actualizar {table}: {exc}"
-        ) from exc
-
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"Supabase PATCH {table}: "
-            f"HTTP {response.status_code}: "
-            f"{response.text}"
-        )
-
-    try:
-        data = response.json()
-
-    except Exception:
-        return []
-
-    if isinstance(data, list):
-        return data
-
-    return []
+    return "D"
 
 
 # ============================================================
-# CARGAR TODOS LOS PARTIDOS
+# CARGAR TODO EL HISTORIAL DE SUPABASE
 # ============================================================
 
-def load_all_finished_matches() -> list[dict[str, Any]]:
+def supabase_get_all_matches() -> list[dict[str, Any]]:
+
+    supabase_url, supabase_key = (
+        get_supabase_config()
+    )
+
+    url = (
+        f"{supabase_url}"
+        "/rest/v1/matches"
+    )
+
+    all_rows: list[
+        dict[str, Any]
+    ] = []
+
+    offset = 0
 
     print("")
-    print("=== CARGANDO PARTIDOS ===")
-
-    all_matches: list[dict[str, Any]] = []
-
-    page_size = 1000
-    offset = 0
+    print("========================================")
+    print("CARGANDO TODO EL HISTORIAL")
+    print("========================================")
 
     while True:
 
-        print(
-            f"  Cargando partidos "
-            f"{offset + 1}-{offset + page_size}..."
+        start = offset
+
+        end = (
+            offset
+            + SUPABASE_PAGE_SIZE
+            - 1
         )
 
-        rows = supabase_get(
-            "matches",
+        params = {
+            "select": "*",
+            "status": "in.(FT,AET,PEN)",
+            "starting_at": "not.is.null",
+            "order": "starting_at.asc,id.asc",
+        }
+
+        headers = supabase_headers(
+            supabase_key,
             {
-                "select": (
-                    "id,"
-                    "starting_at,"
-                    "status,"
-                    "home_team_id,"
-                    "away_team_id,"
-                    "home_goals,"
-                    "away_goals"
+                "Range": (
+                    f"{start}-{end}"
                 ),
-                "status": "in.(FT,AET,PEN)",
-                "order": "starting_at.asc,id.asc",
-                "offset": offset,
-                "limit": page_size,
+                "Prefer": "count=exact",
             },
         )
 
-        if not rows:
-            break
+        print("")
+        print(
+            f"Solicitando historial "
+            f"{start}-{end}..."
+        )
 
-        all_matches.extend(rows)
+        try:
+
+            with httpx.Client(
+                timeout=60
+            ) as client:
+
+                response = client.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "Error de conexión con "
+                f"Supabase: {exc}"
+            ) from exc
+
+        if response.status_code >= 400:
+
+            raise RuntimeError(
+                "Supabase GET matches: "
+                f"HTTP {response.status_code}: "
+                f"{response.text}"
+            )
+
+        try:
+
+            rows = response.json()
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "Supabase devolvió "
+                "JSON inválido."
+            ) from exc
+
+        if not isinstance(
+            rows,
+            list,
+        ):
+
+            raise RuntimeError(
+                "La respuesta de Supabase "
+                "no es una lista."
+            )
+
+        received = len(rows)
+
+        all_rows.extend(rows)
 
         print(
-            f"  Página recibida: {len(rows)}"
+            f"Partidos recibidos en esta página: "
+            f"{received}"
         )
 
-        if len(rows) < page_size:
+        print(
+            f"Total acumulado: "
+            f"{len(all_rows)}"
+        )
+
+        # Si recibimos menos de 1000,
+        # ya llegamos al final.
+        if received < SUPABASE_PAGE_SIZE:
             break
 
-        offset += page_size
+        offset += SUPABASE_PAGE_SIZE
 
+    print("")
     print(
-        f"Partidos recibidos: "
-        f"{len(all_matches)}"
+        "TOTAL DE PARTIDOS HISTÓRICOS: "
+        f"{len(all_rows)}"
     )
 
-    return all_matches
+    return all_rows
 
 
 # ============================================================
-# NORMALIZAR PARTIDOS
+# ESTADO HISTÓRICO DE CADA EQUIPO
 # ============================================================
 
-def normalize_matches(
-    rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-
-    normalized: list[dict[str, Any]] = []
-
-    for row in rows:
-
-        match_id = safe_int(row.get("id"))
-
-        home_team_id = safe_int(
-            row.get("home_team_id")
-        )
-
-        away_team_id = safe_int(
-            row.get("away_team_id")
-        )
-
-        home_goals = safe_int(
-            row.get("home_goals")
-        )
-
-        away_goals = safe_int(
-            row.get("away_goals")
-        )
-
-        starting_at = clean_text(
-            row.get("starting_at")
-        )
-
-        status = clean_text(
-            row.get("status")
-        )
-
-        if match_id is None:
-            continue
-
-        if home_team_id is None:
-            continue
-
-        if away_team_id is None:
-            continue
-
-        if home_goals is None:
-            continue
-
-        if away_goals is None:
-            continue
-
-        if not starting_at:
-            continue
-
-        if not is_finished_status(status):
-            continue
-
-        if home_goals > away_goals:
-            result = "H"
-
-        elif home_goals < away_goals:
-            result = "A"
-
-        else:
-            result = "D"
-
-        normalized.append(
-            {
-                "id": match_id,
-                "starting_at": starting_at,
-                "home_team_id": home_team_id,
-                "away_team_id": away_team_id,
-                "home_goals": home_goals,
-                "away_goals": away_goals,
-                "result": result,
-            }
-        )
-
-    normalized.sort(
-        key=lambda item: (
-            item["starting_at"],
-            item["id"],
-        )
-    )
-
-    return normalized
-
-
-# ============================================================
-# HISTORIAL DE EQUIPOS
-# ============================================================
-
-def empty_team_history() -> list[dict[str, Any]]:
-    return []
-
-
-def get_team_history(
-    histories: dict[int, list[dict[str, Any]]],
-    team_id: int,
-) -> list[dict[str, Any]]:
-
-    if team_id not in histories:
-        histories[team_id] = empty_team_history()
-
-    return histories[team_id]
-
-
-def calculate_team_points(
-    team_match: dict[str, Any],
-    team_id: int,
-) -> int:
-
-    home_team_id = team_match["home_team_id"]
-    away_team_id = team_match["away_team_id"]
-
-    home_goals = team_match["home_goals"]
-    away_goals = team_match["away_goals"]
-
-    if home_team_id == team_id:
-
-        if home_goals > away_goals:
-            return 3
-
-        if home_goals == away_goals:
-            return 1
-
-        return 0
-
-    if away_team_id == team_id:
-
-        if away_goals > home_goals:
-            return 3
-
-        if away_goals == home_goals:
-            return 1
-
-        return 0
-
-    return 0
-
-
-def build_form_features(
-    history: list[dict[str, Any]],
-) -> Optional[dict[str, float]]:
-
-    if len(history) < LOOKBACK_MATCHES:
-        return None
-
-    recent = history[-LOOKBACK_MATCHES:]
-
-    goals_for = 0
-    goals_against = 0
-    points = 0
-
-    for match in recent:
-
-        goals_for += match["goals_for"]
-        goals_against += match["goals_against"]
-        points += match["points"]
+def create_team_state() -> dict[str, deque]:
 
     return {
-        "goals_for": float(goals_for),
-        "goals_against": float(goals_against),
-        "points": float(points),
+        "gf": deque(
+            maxlen=FORM_MATCHES
+        ),
+        "ga": deque(
+            maxlen=FORM_MATCHES
+        ),
+        "points": deque(
+            maxlen=FORM_MATCHES
+        ),
     }
 
 
 # ============================================================
-# CONSTRUIR DATASET SIN DATA LEAKAGE
+# CONSTRUIR DATASET
 # ============================================================
 
 def build_dataset(
-    matches: list[dict[str, Any]],
-) -> tuple[np.ndarray, np.ndarray, int]:
-
-    print("")
-    print("=== CONSTRUYENDO DATASET ===")
-
-    histories: dict[
-        int,
-        list[dict[str, Any]]
-    ] = {}
-
-    X: list[list[float]] = []
-    y: list[str] = []
-
-    discarded = 0
-
-    for match in matches:
-
-        home_team_id = match["home_team_id"]
-        away_team_id = match["away_team_id"]
-
-        home_history = get_team_history(
-            histories,
-            home_team_id,
-        )
-
-        away_history = get_team_history(
-            histories,
-            away_team_id,
-        )
-
-        # ----------------------------------------------------
-        # MUY IMPORTANTE:
-        #
-        # Las características se calculan ANTES de agregar
-        # el partido actual al historial.
-        #
-        # Así evitamos DATA LEAKAGE.
-        # ----------------------------------------------------
-
-        home_form = build_form_features(
-            home_history
-        )
-
-        away_form = build_form_features(
-            away_history
-        )
-
-        if (
-            home_form is None
-            or away_form is None
-        ):
-            discarded += 1
-
-        else:
-
-            features = [
-                home_form["goals_for"],
-                home_form["goals_against"],
-                home_form["points"],
-                away_form["goals_for"],
-                away_form["goals_against"],
-                away_form["points"],
-                (
-                    home_form["goals_for"]
-                    - home_form["goals_against"]
-                )
-                -
-                (
-                    away_form["goals_for"]
-                    - away_form["goals_against"]
-                ),
-                (
-                    home_form["points"]
-                    - away_form["points"]
-                ),
-                1.0,
-            ]
-
-            X.append(features)
-            y.append(match["result"])
-
-        # ----------------------------------------------------
-        # AHORA SÍ agregamos el partido al historial.
-        # ----------------------------------------------------
-
-        home_history.append(
-            {
-                "goals_for": match["home_goals"],
-                "goals_against": match["away_goals"],
-                "points": calculate_team_points(
-                    match,
-                    home_team_id,
-                ),
-            }
-        )
-
-        away_history.append(
-            {
-                "goals_for": match["away_goals"],
-                "goals_against": match["home_goals"],
-                "points": calculate_team_points(
-                    match,
-                    away_team_id,
-                ),
-            }
-        )
-
-    print(
-        f"Ejemplos utilizables: {len(X)}"
-    )
-
-    print(
-        f"Partidos descartados por falta "
-        f"de historial: {discarded}"
-    )
-
-    if not X:
-        raise RuntimeError(
-            "No se pudieron construir ejemplos "
-            "utilizables para entrenar."
-        )
-
-    return (
-        np.asarray(X, dtype=float),
-        np.asarray(y),
-        discarded,
-    )
-
-
-# ============================================================
-# VALIDAR DATASET
-# ============================================================
-
-def validate_dataset(
-    y: np.ndarray,
-) -> None:
-
-    classes, counts = np.unique(
-        y,
-        return_counts=True,
-    )
-
-    print("")
-    print("=== DISTRIBUCIÓN DE RESULTADOS ===")
-
-    for class_name, count in zip(
-        classes,
-        counts,
-    ):
-        print(
-            f"  {class_name}: {count}"
-        )
-
-    required = {"H", "D", "A"}
-
-    available = set(
-        classes.tolist()
-    )
-
-    missing = required - available
-
-    if missing:
-        raise RuntimeError(
-            "El dataset no contiene las tres "
-            f"clases H/D/A. Faltan: {sorted(missing)}"
-        )
-
-
-# ============================================================
-# ENTRENAMIENTO
-# ============================================================
-
-def train_model(
-    X: np.ndarray,
-    y: np.ndarray,
+    rows: list[dict[str, Any]],
 ) -> tuple[
-    LogisticRegression,
-    StandardScaler,
-    float,
-    float,
-    int,
+    np.ndarray,
+    np.ndarray,
     int,
 ]:
 
-    total = len(X)
+    prepared = []
 
-    if total < 100:
-        raise RuntimeError(
-            "Hay muy pocos ejemplos para entrenar "
-            f"de forma fiable: {total}"
+    for row in rows:
+
+        match_id = as_int(
+            row.get("id")
         )
 
-    split_index = int(
-        total * TRAIN_RATIO
-    )
-
-    if split_index <= 0:
-        raise RuntimeError(
-            "El conjunto de entrenamiento quedó vacío."
+        home_team_id = as_int(
+            row.get("home_team_id")
         )
 
-    if split_index >= total:
-        split_index = total - 1
-
-    X_train = X[:split_index]
-    y_train = y[:split_index]
-
-    X_validation = X[split_index:]
-    y_validation = y[split_index:]
-
-    print("")
-    print("=== VALIDACION DEL MODELO ===")
-
-    print(
-        f"Entrenamiento: {len(X_train)}"
-    )
-
-    print(
-        f"Validacion: {len(X_validation)}"
-    )
-
-    train_classes = set(
-        y_train.tolist()
-    )
-
-    if not {"H", "D", "A"}.issubset(
-        train_classes
-    ):
-        raise RuntimeError(
-            "El conjunto de entrenamiento "
-            "no contiene H, D y A."
+        away_team_id = as_int(
+            row.get("away_team_id")
         )
 
-    scaler = StandardScaler()
+        starting_at = parse_date(
+            row.get("starting_at")
+        )
 
-    X_train_scaled = scaler.fit_transform(
-        X_train
+        result = match_result(
+            row
+        )
+
+        if (
+            match_id is None
+            or home_team_id is None
+            or away_team_id is None
+            or starting_at is None
+            or result is None
+        ):
+            continue
+
+        prepared.append(
+            (
+                starting_at,
+                match_id,
+                row,
+                home_team_id,
+                away_team_id,
+                result,
+            )
+        )
+
+    # Orden cronológico.
+    #
+    # Esto es fundamental para evitar
+    # utilizar información del futuro.
+    prepared.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+        )
     )
 
-    X_validation_scaled = scaler.transform(
-        X_validation
+    team_states: dict[
+        int,
+        dict[str, deque],
+    ] = defaultdict(
+        create_team_state
     )
 
-    model = LogisticRegression(
-        solver="lbfgs",
-        max_iter=5000,
-        C=1.0,
-        random_state=42,
-        multi_class="auto",
-    )
+    X: list[list[float]] = []
 
-    model.fit(
-        X_train_scaled,
-        y_train,
-    )
+    y: list[str] = []
 
-    probabilities = model.predict_proba(
-        X_validation_scaled
-    )
+    skipped_no_history = 0
 
-    predictions = model.predict(
-        X_validation_scaled
-    )
+    for (
+        starting_at,
+        match_id,
+        row,
+        home_team_id,
+        away_team_id,
+        result,
+    ) in prepared:
 
-    accuracy = accuracy_score(
-        y_validation,
-        predictions,
-    )
+        home_state = team_states[
+            home_team_id
+        ]
 
-    validation_log_loss = log_loss(
-        y_validation,
-        probabilities,
-        labels=model.classes_,
-    )
+        away_state = team_states[
+            away_team_id
+        ]
 
-    print(
-        f"Accuracy: {accuracy:.4f}"
-    )
+        # ----------------------------------------------------
+        # IMPORTANTE:
+        # Solo utilizamos información ANTERIOR al partido.
+        # ----------------------------------------------------
 
-    print(
-        f"Log loss: {validation_log_loss:.4f}"
-    )
+        home_has_history = (
+            len(home_state["gf"])
+            >= FORM_MATCHES
+        )
+
+        away_has_history = (
+            len(away_state["gf"])
+            >= FORM_MATCHES
+        )
+
+        if (
+            not home_has_history
+            or not away_has_history
+        ):
+
+            skipped_no_history += 1
+
+        else:
+
+            home_goals_for = float(
+                sum(
+                    home_state["gf"]
+                )
+            )
+
+            home_goals_against = float(
+                sum(
+                    home_state["ga"]
+                )
+            )
+
+            home_points = float(
+                sum(
+                    home_state["points"]
+                )
+            )
+
+            away_goals_for = float(
+                sum(
+                    away_state["gf"]
+                )
+            )
+
+            away_goals_against = float(
+                sum(
+                    away_state["ga"]
+                )
+            )
+
+            away_points = float(
+                sum(
+                    away_state["points"]
+                )
+            )
+
+            goals_form_difference = (
+                (
+                    home_goals_for
+                    - home_goals_against
+                )
+                -
+                (
+                    away_goals_for
+                    - away_goals_against
+                )
+            )
+
+            points_form_difference = (
+                home_points
+                - away_points
+            )
+
+            features = [
+                home_goals_for,
+                home_goals_against,
+                home_points,
+                away_goals_for,
+                away_goals_against,
+                away_points,
+                goals_form_difference,
+                points_form_difference,
+                1.0,
+            ]
+
+            X.append(
+                features
+            )
+
+            y.append(
+                result
+            )
+
+        # ----------------------------------------------------
+        # AHORA actualizamos el historial.
+        #
+        # Esto ocurre DESPUÉS de crear las features,
+        # evitando fuga de información.
+        # ----------------------------------------------------
+
+        home_goals = as_int(
+            row.get("home_goals")
+        )
+
+        away_goals = as_int(
+            row.get("away_goals")
+        )
+
+        if (
+            home_goals is None
+            or away_goals is None
+        ):
+            continue
+
+        home_state["gf"].append(
+            float(home_goals)
+        )
+
+        home_state["ga"].append(
+            float(away_goals)
+        )
+
+        away_state["gf"].append(
+            float(away_goals)
+        )
+
+        away_state["ga"].append(
+            float(home_goals)
+        )
+
+        if result == "H":
+
+            home_state["points"].append(
+                3.0
+            )
+
+            away_state["points"].append(
+                0.0
+            )
+
+        elif result == "D":
+
+            home_state["points"].append(
+                1.0
+            )
+
+            away_state["points"].append(
+                1.0
+            )
+
+        else:
+
+            home_state["points"].append(
+                0.0
+            )
+
+            away_state["points"].append(
+                3.0
+            )
+
+    if not X:
+
+        raise RuntimeError(
+            "No hay suficientes partidos "
+            "con historial previo para "
+            "crear el dataset."
+        )
 
     return (
-        model,
-        scaler,
-        float(accuracy),
-        float(validation_log_loss),
-        len(X_train),
-        len(X_validation),
+        np.asarray(
+            X,
+            dtype=np.float64,
+        ),
+        np.asarray(
+            y,
+        ),
+        skipped_no_history,
     )
 
 
 # ============================================================
-# MODELO ACTIVO ANTERIOR
+# MODELO ACTIVO ACTUAL
 # ============================================================
 
-def load_active_model() -> Optional[dict[str, Any]]:
+def get_active_model() -> Optional[
+    dict[str, Any]
+]:
 
-    rows = supabase_get(
-        "model_versions",
-        {
-            "select": (
-                "version,"
-                "model_name,"
-                "trained_at,"
-                "training_matches,"
-                "metrics,"
-                "active"
-            ),
-            "active": "eq.true",
-            "limit": 1,
-        },
+    supabase_url, supabase_key = (
+        get_supabase_config()
     )
+
+    url = (
+        f"{supabase_url}"
+        "/rest/v1/model_versions"
+    )
+
+    params = {
+        "select": (
+            "version,"
+            "model_name,"
+            "trained_at,"
+            "training_matches,"
+            "metrics,"
+            "active"
+        ),
+        "active": "eq.true",
+        "limit": "1",
+    }
+
+    try:
+
+        with httpx.Client(
+            timeout=60
+        ) as client:
+
+            response = client.get(
+                url,
+                params=params,
+                headers=supabase_headers(
+                    supabase_key
+                ),
+            )
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            "Error consultando el "
+            f"modelo activo: {exc}"
+        ) from exc
+
+    if response.status_code >= 400:
+
+        raise RuntimeError(
+            "Supabase GET "
+            "model_versions: "
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+    rows = response.json()
 
     if not rows:
         return None
@@ -851,374 +697,620 @@ def load_active_model() -> Optional[dict[str, Any]]:
     return rows[0]
 
 
-def get_previous_log_loss(
-    active_model: Optional[dict[str, Any]],
-) -> Optional[float]:
-
-    if not active_model:
-        return None
-
-    metrics = active_model.get(
-        "metrics"
-    )
-
-    if not isinstance(metrics, dict):
-        return None
-
-    value = metrics.get(
-        "validation_log_loss"
-    )
-
-    if value is None:
-        value = metrics.get(
-            "log_loss"
-        )
-
-    return safe_float(value)
-
-
-# ============================================================
-# SERIALIZAR MODELO
-# ============================================================
-
-def serialize_model(
-    model: LogisticRegression,
-    scaler: StandardScaler,
-    accuracy: float,
-    validation_log_loss: float,
-    training_matches: int,
-    validation_matches: int,
-    total_dataset_matches: int,
-    discarded_matches: int,
-) -> dict[str, Any]:
-
-    coefficients = (
-        model.coef_.tolist()
-    )
-
-    intercept = (
-        model.intercept_.tolist()
-    )
-
-    classes = [
-        str(value)
-        for value in model.classes_.tolist()
-    ]
-
-    scaler_mean = [
-        float(value)
-        for value in scaler.mean_.tolist()
-    ]
-
-    scaler_scale = [
-        float(value)
-        for value in scaler.scale_.tolist()
-    ]
-
-    return {
-        "model_type": (
-            "multinomial_logistic_regression"
-        ),
-        "model_name": MODEL_NAME,
-
-        "feature_names": FEATURE_NAMES,
-
-        "classes": classes,
-
-        "coefficients": coefficients,
-
-        "intercept": intercept,
-
-        "scaler_mean": scaler_mean,
-
-        "scaler_scale": scaler_scale,
-
-        "validation_accuracy": accuracy,
-
-        "validation_log_loss": (
-            validation_log_loss
-        ),
-
-        "training_matches": (
-            training_matches
-        ),
-
-        "validation_matches": (
-            validation_matches
-        ),
-
-        "dataset_matches": (
-            total_dataset_matches
-        ),
-
-        "discarded_matches": (
-            discarded_matches
-        ),
-
-        "trained_at": utc_now(),
-    }
-
-
 # ============================================================
 # GUARDAR MODELO
 # ============================================================
 
-def save_model_version(
-    version: str,
-    metrics: dict[str, Any],
-    active: bool,
+def save_model(
+    payload: dict[str, Any],
 ) -> None:
 
-    payload = {
-        "version": version,
-        "model_name": MODEL_NAME,
-        "trained_at": utc_now(),
-        "training_matches": (
-            metrics["training_matches"]
-        ),
-        "metrics": metrics,
-        "active": active,
-    }
-
-    supabase_upsert(
-        "model_versions",
-        payload,
-        on_conflict="version",
+    supabase_url, supabase_key = (
+        get_supabase_config()
     )
+
+    url = (
+        f"{supabase_url}"
+        "/rest/v1/model_versions"
+    )
+
+    headers = supabase_headers(
+        supabase_key,
+        {
+            "Prefer": (
+                "resolution=merge-duplicates,"
+                "return=minimal"
+            ),
+        },
+    )
+
+    try:
+
+        with httpx.Client(
+            timeout=60
+        ) as client:
+
+            response = client.post(
+                url,
+                headers=headers,
+                json=payload,
+            )
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            "Error guardando el modelo "
+            f"en Supabase: {exc}"
+        ) from exc
+
+    if response.status_code >= 400:
+
+        raise RuntimeError(
+            "Supabase POST "
+            "model_versions: "
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
 
 
 # ============================================================
 # DESACTIVAR MODELOS ANTERIORES
 # ============================================================
 
-def deactivate_existing_models() -> None:
+def deactivate_all_models() -> None:
 
-    print(
-        "Desactivando modelo anterior..."
+    supabase_url, supabase_key = (
+        get_supabase_config()
     )
 
-    supabase_patch(
-        "model_versions",
+    url = (
+        f"{supabase_url}"
+        "/rest/v1/model_versions"
+    )
+
+    headers = supabase_headers(
+        supabase_key,
         {
-            "active": "eq.true",
-        },
-        {
-            "active": False,
+            "Prefer": "return=minimal"
         },
     )
+
+    params = {
+        "active": "eq.true"
+    }
+
+    try:
+
+        with httpx.Client(
+            timeout=60
+        ) as client:
+
+            response = client.patch(
+                url,
+                params=params,
+                headers=headers,
+                json={
+                    "active": False
+                },
+            )
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            "Error desactivando "
+            f"modelos anteriores: {exc}"
+        ) from exc
+
+    if response.status_code >= 400:
+
+        raise RuntimeError(
+            "Supabase PATCH "
+            "model_versions: "
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
 
 
 # ============================================================
-# ENTRENAMIENTO PRINCIPAL
+# ACTIVAR UNA VERSIÓN CONCRETA
+# ============================================================
+
+def activate_model(
+    version: str,
+) -> None:
+
+    supabase_url, supabase_key = (
+        get_supabase_config()
+    )
+
+    url = (
+        f"{supabase_url}"
+        "/rest/v1/model_versions"
+    )
+
+    headers = supabase_headers(
+        supabase_key,
+        {
+            "Prefer": "return=minimal"
+        },
+    )
+
+    params = {
+        "version": f"eq.{version}"
+    }
+
+    try:
+
+        with httpx.Client(
+            timeout=60
+        ) as client:
+
+            response = client.patch(
+                url,
+                params=params,
+                headers=headers,
+                json={
+                    "active": True
+                },
+            )
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            "Error activando el "
+            f"modelo {version}: {exc}"
+        ) from exc
+
+    if response.status_code >= 400:
+
+        raise RuntimeError(
+            "Supabase PATCH modelo "
+            f"{version}: "
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+
+# ============================================================
+# ENTRENAMIENTO
 # ============================================================
 
 def main() -> None:
 
-    print("")
     print("========================================")
     print("FUTBOL IA - ENTRENAMIENTO REAL")
     print("========================================")
 
-    print(
-        f"Modelo: {MODEL_NAME}"
-    )
-
-    print(
-        f"Historial utilizado: "
-        f"últimos {LOOKBACK_MATCHES} partidos"
-    )
-
-    print(
-        "División temporal: "
-        f"{int(TRAIN_RATIO * 100)}% / "
-        f"{int((1 - TRAIN_RATIO) * 100)}%"
-    )
-
     # --------------------------------------------------------
-    # VALIDAR CONFIGURACIÓN
+    # CARGAR TODO EL HISTORIAL
     # --------------------------------------------------------
 
-    get_supabase_config()
-
-    # --------------------------------------------------------
-    # CARGAR DATOS
-    # --------------------------------------------------------
-
-    raw_matches = (
-        load_all_finished_matches()
+    rows = (
+        supabase_get_all_matches()
     )
 
-    if not raw_matches:
+    if len(rows) < 100:
+
         raise RuntimeError(
-            "No existen partidos terminados "
-            "en Supabase."
-        )
-
-    matches = normalize_matches(
-        raw_matches
-    )
-
-    print(
-        f"Partidos válidos: {len(matches)}"
-    )
-
-    if len(matches) < 100:
-        raise RuntimeError(
-            "Hay menos de 100 partidos válidos. "
-            "No se realizará el entrenamiento."
+            f"Solo hay {len(rows)} "
+            "partidos históricos. "
+            "Se necesitan al menos 100."
         )
 
     # --------------------------------------------------------
-    # CONSTRUIR FEATURES
+    # CONSTRUIR DATASET
     # --------------------------------------------------------
 
-    X, y, discarded = (
-        build_dataset(matches)
-    )
-
-    # --------------------------------------------------------
-    # VALIDAR CLASES
-    # --------------------------------------------------------
-
-    validate_dataset(y)
-
-    # --------------------------------------------------------
-    # ENTRENAR
-    # --------------------------------------------------------
+    print("")
+    print("========================================")
+    print("CONSTRUYENDO DATASET")
+    print("========================================")
 
     (
-        model,
-        scaler,
-        accuracy,
-        validation_log_loss,
-        training_matches,
-        validation_matches,
-    ) = train_model(
         X,
         y,
+        skipped_no_history,
+    ) = build_dataset(
+        rows
+    )
+
+    print("")
+    print(
+        f"Partidos recibidos: "
+        f"{len(rows)}"
+    )
+
+    print(
+        f"Ejemplos utilizables: "
+        f"{len(X)}"
+    )
+
+    print(
+        f"Partidos descartados por "
+        f"falta de historial: "
+        f"{skipped_no_history}"
     )
 
     # --------------------------------------------------------
-    # MODELO ACTUAL
+    # DISTRIBUCIÓN DE RESULTADOS
+    # --------------------------------------------------------
+
+    classes_found, counts = (
+        np.unique(
+            y,
+            return_counts=True,
+        )
+    )
+
+    distribution = {
+        str(
+            class_name
+        ): int(
+            count
+        )
+        for (
+            class_name,
+            count,
+        ) in zip(
+            classes_found,
+            counts,
+        )
+    }
+
+    print(
+        f"Distribución H/D/A: "
+        f"{distribution}"
+    )
+
+    if len(
+        classes_found
+    ) < 3:
+
+        raise RuntimeError(
+            "El dataset no contiene "
+            "las tres clases H/D/A."
+        )
+
+    if len(X) < 150:
+
+        raise RuntimeError(
+            f"Solo hay {len(X)} "
+            "ejemplos utilizables. "
+            "Se necesitan al menos 150."
+        )
+
+    # --------------------------------------------------------
+    # DIVISIÓN CRONOLÓGICA
+    # --------------------------------------------------------
+
+    split_index = int(
+        len(X) * 0.80
+    )
+
+    if (
+        split_index <= 0
+        or split_index >= len(X)
+    ):
+
+        raise RuntimeError(
+            "No se pudo crear la "
+            "división cronológica 80/20."
+        )
+
+    X_train = X[
+        :split_index
+    ]
+
+    y_train = y[
+        :split_index
+    ]
+
+    X_valid = X[
+        split_index:
+    ]
+
+    y_valid = y[
+        split_index:
+    ]
+
+    print("")
+    print("========================================")
+    print("VALIDACIÓN DEL MODELO")
+    print("========================================")
+
+    print(
+        f"Entrenamiento: "
+        f"{len(X_train)}"
+    )
+
+    print(
+        f"Validación: "
+        f"{len(X_valid)}"
+    )
+
+    train_classes = np.unique(
+        y_train
+    )
+
+    if len(
+        train_classes
+    ) < 3:
+
+        raise RuntimeError(
+            "El conjunto de entrenamiento "
+            "no contiene H/D/A."
+        )
+
+    # --------------------------------------------------------
+    # ESCALADO
+    # --------------------------------------------------------
+
+    scaler = StandardScaler()
+
+    X_train_scaled = (
+        scaler.fit_transform(
+            X_train
+        )
+    )
+
+    X_valid_scaled = (
+        scaler.transform(
+            X_valid
+        )
+    )
+
+    # --------------------------------------------------------
+    # REGRESIÓN LOGÍSTICA MULTICLASE
+    # --------------------------------------------------------
+
+    model = LogisticRegression(
+        solver="lbfgs",
+        max_iter=3000,
+        C=1.0,
+        multi_class="auto",
+        random_state=RANDOM_STATE,
+    )
+
+    model.fit(
+        X_train_scaled,
+        y_train,
+    )
+
+    # --------------------------------------------------------
+    # VALIDACIÓN
+    # --------------------------------------------------------
+
+    probabilities = (
+        model.predict_proba(
+            X_valid_scaled
+        )
+    )
+
+    predictions = (
+        model.predict(
+            X_valid_scaled
+        )
+    )
+
+    accuracy = float(
+        accuracy_score(
+            y_valid,
+            predictions,
+        )
+    )
+
+    validation_log_loss = float(
+        log_loss(
+            y_valid,
+            probabilities,
+            labels=model.classes_,
+        )
+    )
+
+    print(
+        f"Accuracy: "
+        f"{accuracy:.4f}"
+    )
+
+    print(
+        f"Log loss: "
+        f"{validation_log_loss:.4f}"
+    )
+
+    # --------------------------------------------------------
+    # OBTENER MODELO ACTUAL
     # --------------------------------------------------------
 
     active_model = (
-        load_active_model()
+        get_active_model()
     )
 
-    previous_log_loss = (
-        get_previous_log_loss(
-            active_model
+    previous_log_loss = None
+
+    if active_model:
+
+        old_metrics = (
+            active_model.get(
+                "metrics"
+            )
+            or {}
         )
+
+        try:
+
+            previous_log_loss = float(
+                old_metrics.get(
+                    "validation_log_loss"
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            previous_log_loss = None
+
+    # --------------------------------------------------------
+    # DECIDIR SI ACTIVAR
+    # --------------------------------------------------------
+
+    should_activate = (
+        active_model is None
+        or previous_log_loss is None
+        or validation_log_loss
+        < previous_log_loss
     )
-
-    # --------------------------------------------------------
-    # DECIDIR ACTIVACIÓN
-    # --------------------------------------------------------
-
-    if previous_log_loss is None:
-        should_activate = True
-
-    else:
-        should_activate = (
-            validation_log_loss
-            <= previous_log_loss
-        )
 
     # --------------------------------------------------------
     # CREAR VERSIÓN
     # --------------------------------------------------------
 
+    trained_at = utc_now()
+
     version = (
         "1X2-"
         + datetime.now(
             timezone.utc
-        ).strftime("%Y%m%d-%H%M%S")
+        ).strftime(
+            "%Y%m%d-%H%M%S"
+        )
     )
 
-    metrics = serialize_model(
-        model=model,
-        scaler=scaler,
-        accuracy=accuracy,
-        validation_log_loss=(
+    # --------------------------------------------------------
+    # SERIALIZAR MODELO
+    #
+    # IMPORTANTE:
+    # Estos nombres deben coincidir con
+    # app/ai_predict.py
+    # --------------------------------------------------------
+
+    metrics = {
+
+        "accuracy": accuracy,
+
+        "validation_accuracy": (
+            accuracy
+        ),
+
+        "log_loss": (
             validation_log_loss
         ),
-        training_matches=(
-            training_matches
+
+        "validation_log_loss": (
+            validation_log_loss
         ),
-        validation_matches=(
-            validation_matches
+
+        "previous_log_loss": (
+            previous_log_loss
         ),
-        total_dataset_matches=len(
-            matches
+
+        # Datos del dataset completo
+        "total_historical_matches": (
+            len(rows)
         ),
-        discarded_matches=discarded,
-    )
+
+        "usable_examples": (
+            len(X)
+        ),
+
+        "training_examples": (
+            len(X_train)
+        ),
+
+        "validation_examples": (
+            len(X_valid)
+        ),
+
+        "skipped_no_history": (
+            skipped_no_history
+        ),
+
+        # Features
+        "feature_names": (
+            FEATURE_NAMES
+        ),
+
+        "features": (
+            FEATURE_NAMES
+        ),
+
+        # Clases
+        "classes": [
+            str(value)
+            for value
+            in model.classes_
+        ],
+
+        # Modelo
+        "coefficients": (
+            model.coef_.tolist()
+        ),
+
+        "intercept": (
+            model.intercept_.tolist()
+        ),
+
+        # StandardScaler
+        "scaler_mean": (
+            scaler.mean_.tolist()
+        ),
+
+        "scaler_scale": (
+            scaler.scale_.tolist()
+        ),
+
+        "model_type": (
+            "multinomial_logistic_regression"
+        ),
+
+        "model_name": (
+            MODEL_NAME
+        ),
+
+        "trained_at": (
+            trained_at
+        ),
+    }
 
     # --------------------------------------------------------
-    # GUARDAR NUEVO MODELO
+    # GUARDAR COMO INACTIVO PRIMERO
     # --------------------------------------------------------
 
-    save_model_version(
-        version=version,
-        metrics=metrics,
-        active=False,
-    )
+    payload = {
 
-    # --------------------------------------------------------
-    # ACTIVAR SI MEJORA
-    # --------------------------------------------------------
+        "version": version,
 
-    if should_activate:
+        "model_name": (
+            MODEL_NAME
+        ),
 
-        deactivate_existing_models()
+        "trained_at": (
+            trained_at
+        ),
 
-        supabase_patch(
-            "model_versions",
-            {
-                "version": f"eq.{version}",
-            },
-            {
-                "active": True,
-            },
-        )
+        "training_matches": (
+            len(X_train)
+        ),
 
-    # --------------------------------------------------------
-    # RESULTADO
-    # --------------------------------------------------------
+        "metrics": metrics,
+
+        # Primero lo guardamos inactivo.
+        "active": False,
+    }
 
     print("")
-    print("=== MODELO GUARDADO ===")
+    print("========================================")
+    print("MODELO NUEVO")
+    print("========================================")
 
     print(
-        f"Version: {version}"
+        f"Versión: {version}"
     )
 
     print(
-        f"Accuracy: {accuracy:.4f}"
-    )
-
-    print(
-        f"Log loss: {validation_log_loss:.4f}"
-    )
-
-    if previous_log_loss is None:
-        print(
-            "Modelo anterior: ninguno"
-        )
-    else:
-        print(
-            "Modelo anterior: "
-            f"{previous_log_loss}"
-        )
-
-    print(
-        f"Activado: {should_activate}"
-    )
-
-    print(
-        f"Partidos del dataset: "
-        f"{len(matches)}"
+        f"Historial total: "
+        f"{len(rows)}"
     )
 
     print(
@@ -1228,13 +1320,81 @@ def main() -> None:
 
     print(
         f"Entrenamiento: "
-        f"{training_matches}"
+        f"{len(X_train)}"
     )
 
     print(
-        f"Validacion: "
-        f"{validation_matches}"
+        f"Validación: "
+        f"{len(X_valid)}"
     )
+
+    print(
+        f"Accuracy: "
+        f"{accuracy:.4f}"
+    )
+
+    print(
+        f"Log loss: "
+        f"{validation_log_loss:.4f}"
+    )
+
+    print(
+        f"Modelo anterior: "
+        f"{previous_log_loss}"
+    )
+
+    print(
+        f"¿Debe activarse?: "
+        f"{should_activate}"
+    )
+
+    # Guardamos el nuevo modelo.
+    save_model(
+        payload
+    )
+
+    # --------------------------------------------------------
+    # ACTIVACIÓN SEGURA
+    # --------------------------------------------------------
+
+    if should_activate:
+
+        print("")
+        print(
+            "El nuevo modelo mejora "
+            "al modelo activo."
+        )
+
+        print(
+            "Desactivando modelo anterior..."
+        )
+
+        deactivate_all_models()
+
+        print(
+            "Activando nuevo modelo..."
+        )
+
+        activate_model(
+            version
+        )
+
+        print(
+            "✅ Nuevo modelo activado."
+        )
+
+    else:
+
+        print("")
+        print(
+            "ℹ️ El nuevo modelo NO se activa "
+            "porque no mejora el log loss "
+            "del modelo actualmente activo."
+        )
+
+    # --------------------------------------------------------
+    # RESUMEN FINAL
+    # --------------------------------------------------------
 
     print("")
     print("========================================")
@@ -1242,18 +1402,42 @@ def main() -> None:
     print("========================================")
 
     result = {
+
         "version": version,
-        "active": should_activate,
+
+        "active": (
+            should_activate
+        ),
+
         "accuracy": accuracy,
-        "log_loss": validation_log_loss,
+
+        "log_loss": (
+            validation_log_loss
+        ),
+
         "previous_log_loss": (
             previous_log_loss
         ),
-        "dataset_matches": len(matches),
-        "usable_examples": len(X),
-        "discarded_matches": discarded,
-        "training_matches": training_matches,
-        "validation_matches": validation_matches,
+
+        "total_historical_matches": (
+            len(rows)
+        ),
+
+        "usable_examples": (
+            len(X)
+        ),
+
+        "training_matches": (
+            len(X_train)
+        ),
+
+        "validation_matches": (
+            len(X_valid)
+        ),
+
+        "skipped_no_history": (
+            skipped_no_history
+        ),
     }
 
     print(
@@ -1264,9 +1448,7 @@ def main() -> None:
         )
     )
 
-    print(
-        "========================================"
-    )
+    print("========================================")
 
 
 # ============================================================
@@ -1276,13 +1458,14 @@ def main() -> None:
 if __name__ == "__main__":
 
     try:
+
         main()
 
     except KeyboardInterrupt:
 
         print("")
         print(
-            "Proceso cancelado por el usuario."
+            "Proceso cancelado."
         )
 
         sys.exit(130)
