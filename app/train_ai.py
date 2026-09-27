@@ -1,511 +1,1128 @@
-import json
-import os
-import sys
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from __future__ import annotations
 
+import hashlib
+import json
+import math
+import os
+from datetime import datetime, timezone
+from typing import Any
+
+import httpx
 import numpy as np
-import requests
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss
 from sklearn.preprocessing import StandardScaler
 
-
-APP_NAME = "Fútbol IA"
-MODEL_NAME = "FutbolIA-1X2-LogisticRegression"
-
-# IMPORTANTE:
-# Este script NO llama a API-Football.
-# Entrena exclusivamente con el historial que ya existe en Supabase.
-# Así no consume la cuota diaria de la API de fútbol.
-
-PAGE_SIZE = 1000
-REQUEST_TIMEOUT = 30
-
-VALID_FINISHED_STATUSES = {"FT", "AET", "PEN"}
-
-FEATURE_NAMES = [
-    "home_goals_for_5",
-    "home_goals_against_5",
-    "home_points_5",
-    "away_goals_for_5",
-    "away_goals_against_5",
-    "away_points_5",
-    "goals_form_difference",
-    "points_form_difference",
-    "home_advantage",
-]
-
-
-class SupabaseError(RuntimeError):
-    pass
-
-
-def require_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Falta la variable de entorno: {name}")
-    return value
-
-
-SUPABASE_URL = require_env("SUPABASE_URL").rstrip("/")
-SUPABASE_SECRET_KEY = require_env("SUPABASE_SECRET_KEY")
-
-
-session = requests.Session()
-session.headers.update(
-    {
-        "apikey": SUPABASE_SECRET_KEY,
-        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
-        "Content-Type": "application/json",
-    }
+from app.nestor_features import (
+    FEATURE_NAMES,
+    FEATURE_SCHEMA_VERSION,
+    build_training_dataset,
+    clean_match,
 )
 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "").strip()
 
-def supabase_request(
-    method: str,
-    path: str,
-    *,
-    params: Dict[str, Any] | None = None,
-    payload: Any | None = None,
-    headers: Dict[str, str] | None = None,
-) -> requests.Response:
-    url = f"{SUPABASE_URL}/rest/v1/{path.lstrip('/')}"
-    merged_headers = dict(session.headers)
-    if headers:
-        merged_headers.update(headers)
+MODEL_NAME = "NESTOR-1X2-LogisticRegression"
+MODEL_FAMILY = "1X2"
+MODEL_PROTOCOL_VERSION = "NESTOR-EVAL-v1.0"
 
-    try:
-        response = session.request(
-            method,
-            url,
+MIN_MATCHES = 80
+WINDOW = 5
+PAGE_SIZE = 1000
+
+CALIBRATION_GRID = np.linspace(0.50, 3.00, 101)
+
+ACTIVATION_MARGIN = 0.001
+
+
+if not SUPABASE_URL:
+    raise RuntimeError("Falta SUPABASE_URL")
+
+if not SUPABASE_SECRET_KEY:
+    raise RuntimeError("Falta SUPABASE_SECRET_KEY")
+
+
+HEADERS = {
+    "apikey": SUPABASE_SECRET_KEY,
+    "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+    "Content-Type": "application/json",
+}
+
+
+def supabase_url(table: str) -> str:
+    return f"{SUPABASE_URL}/rest/v1/{table}"
+
+
+def supabase_get(
+    table: str,
+    params: dict[str, Any]
+) -> list[dict[str, Any]]:
+
+    with httpx.Client(timeout=60.0) as client:
+        response = client.get(
+            supabase_url(table),
+            headers=HEADERS,
+            params=params
+        )
+
+    if response.status_code not in (200, 206):
+        raise RuntimeError(
+            f"Supabase GET {table} "
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+    data = response.json()
+
+    return data if isinstance(data, list) else []
+
+
+def supabase_post(
+    table: str,
+    payload: dict[str, Any]
+) -> list[dict[str, Any]]:
+
+    headers = {
+        **HEADERS,
+        "Prefer": "return=representation"
+    }
+
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(
+            supabase_url(table),
+            headers=headers,
+            json=payload
+        )
+
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Supabase POST {table} "
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+    return response.json() if response.text else []
+
+
+def supabase_patch(
+    table: str,
+    params: dict[str, Any],
+    payload: dict[str, Any]
+) -> list[dict[str, Any]]:
+
+    headers = {
+        **HEADERS,
+        "Prefer": "return=representation"
+    }
+
+    with httpx.Client(timeout=60.0) as client:
+        response = client.patch(
+            supabase_url(table),
+            headers=headers,
             params=params,
-            json=payload,
-            headers=merged_headers,
-            timeout=REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        raise SupabaseError(f"Error de conexión con Supabase: {exc}") from exc
-
-    if not response.ok:
-        body = response.text[:2000]
-        raise SupabaseError(
-            f"Supabase {method} {path}: HTTP {response.status_code}: {body}"
+            json=payload
         )
 
-    return response
+    if response.status_code not in (200, 204):
+        raise RuntimeError(
+            f"Supabase PATCH {table} "
+            f"HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+    return response.json() if response.text else []
 
 
-def fetch_all_finished_matches() -> List[Dict[str, Any]]:
-    """Lee TODOS los partidos finalizados disponibles en Supabase por páginas."""
-    all_rows: List[Dict[str, Any]] = []
+def load_finished_matches() -> list[dict[str, Any]]:
+
+    rows: list[dict[str, Any]] = []
+
     offset = 0
 
-    print("=== CARGANDO HISTORIAL DESDE SUPABASE ===")
-    print("Fuente: public.matches")
-    print("API-Football: NO SE USA EN ESTE PASO")
-
     while True:
-        params = {
-            "select": (
-                "id,league_id,season_id,home_team_id,away_team_id,"
-                "starting_at,status,home_goals,away_goals"
-            ),
-            "status": "in.(FT,AET,PEN)",
-            "order": "starting_at.asc,id.asc",
-            "limit": PAGE_SIZE,
-            "offset": offset,
-        }
 
-        response = supabase_request("GET", "matches", params=params)
-        try:
-            rows = response.json()
-        except ValueError as exc:
-            raise SupabaseError("Supabase devolvió JSON inválido al leer matches") from exc
+        page = supabase_get(
+            "matches",
+            {
+                "select": (
+                    "id,"
+                    "starting_at,"
+                    "status,"
+                    "home_team_id,"
+                    "away_team_id,"
+                    "home_goals,"
+                    "away_goals"
+                ),
+                "status": "in.(FT,AET,PEN)",
+                "order": "starting_at.asc,id.asc",
+                "limit": str(PAGE_SIZE),
+                "offset": str(offset),
+            },
+        )
 
-        if not isinstance(rows, list):
-            raise SupabaseError("La respuesta de Supabase para matches no es una lista")
-
-        if not rows:
+        if not page:
             break
 
-        all_rows.extend(rows)
-        print(f"Página: offset={offset}, filas={len(rows)}, acumuladas={len(all_rows)}")
+        rows.extend(page)
 
-        if len(rows) < PAGE_SIZE:
+        if len(page) < PAGE_SIZE:
             break
 
         offset += PAGE_SIZE
 
-    return all_rows
+    return rows
 
 
-def parse_float(value: Any, default: float | None = None) -> float | None:
-    if value is None or value == "":
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+def normalize_matches(
+    rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+
+    seen: set[int] = set()
+
+    cleaned: list[dict[str, Any]] = []
+
+    for row in rows:
+
+        item = clean_match(row)
+
+        if item is None:
+            continue
+
+        if item["id"] in seen:
+            continue
+
+        seen.add(item["id"])
+
+        cleaned.append(item)
+
+    cleaned.sort(
+        key=lambda item: (
+            item["starting_at"],
+            item["id"]
+        )
+    )
+
+    return cleaned
 
 
-def parse_int(value: Any, default: int | None = None) -> int | None:
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+def dataset_fingerprint(
+    match_ids: list[int]
+) -> str:
+
+    raw = ":".join(
+        str(value)
+        for value in match_ids
+    ).encode("utf-8")
+
+    return hashlib.sha256(
+        raw
+    ).hexdigest()[:24]
 
 
-def normalize_match(row: Dict[str, Any]) -> Dict[str, Any] | None:
-    home_team_id = parse_int(row.get("home_team_id"))
-    away_team_id = parse_int(row.get("away_team_id"))
-    home_goals = parse_int(row.get("home_goals"))
-    away_goals = parse_int(row.get("away_goals"))
-    starting_at = str(row.get("starting_at") or "").strip()
-    status = str(row.get("status") or "").strip().upper()
+def brier_multiclass(
+    y_true: np.ndarray,
+    probabilities: np.ndarray
+) -> float:
 
-    if not home_team_id or not away_team_id:
-        return None
-    if home_team_id == away_team_id:
-        return None
-    if home_goals is None or away_goals is None:
-        return None
-    if status not in VALID_FINISHED_STATUSES:
-        return None
-    if not starting_at:
-        return None
+    one_hot = np.zeros_like(probabilities)
+
+    for idx, target in enumerate(y_true):
+        one_hot[idx, int(target)] = 1.0
+
+    return float(
+        np.mean(
+            np.sum(
+                (probabilities - one_hot) ** 2,
+                axis=1
+            )
+        )
+    )
+
+
+def softmax(
+    logits: np.ndarray,
+    temperature: float = 1.0
+) -> np.ndarray:
+
+    t = max(
+        float(temperature),
+        0.05
+    )
+
+    z = logits / t
+
+    z = z - np.max(
+        z,
+        axis=1,
+        keepdims=True
+    )
+
+    exp_z = np.exp(z)
+
+    return exp_z / np.sum(
+        exp_z,
+        axis=1,
+        keepdims=True
+    )
+
+
+def fit_temperature(
+    logits: np.ndarray,
+    y: np.ndarray
+) -> float:
+
+    best_t = 1.0
+    best_loss = math.inf
+
+    for candidate in CALIBRATION_GRID:
+
+        probabilities = softmax(
+            logits,
+            float(candidate)
+        )
+
+        loss = float(
+            log_loss(
+                y,
+                probabilities,
+                labels=[0, 1, 2]
+            )
+        )
+
+        if loss < best_loss - 1e-12:
+            best_loss = loss
+            best_t = float(candidate)
+
+    return best_t
+
+
+def model_probabilities(
+    model: LogisticRegression,
+    scaler: StandardScaler,
+    X: np.ndarray,
+    temperature: float
+) -> np.ndarray:
+
+    Xs = scaler.transform(X)
+
+    logits = (
+        Xs @ model.coef_.T
+        + model.intercept_
+    )
+
+    return softmax(
+        logits,
+        temperature
+    )
+
+
+def feature_defaults(
+    X_train: np.ndarray
+) -> dict[str, float]:
+
+    medians = np.median(
+        X_train,
+        axis=0
+    )
 
     return {
-        "id": parse_int(row.get("id"), 0),
-        "league_id": parse_int(row.get("league_id")),
-        "season_id": parse_int(row.get("season_id")),
-        "home_team_id": home_team_id,
-        "away_team_id": away_team_id,
-        "starting_at": starting_at,
-        "status": status,
-        "home_goals": home_goals,
-        "away_goals": away_goals,
+        name: float(value)
+        for name, value in zip(
+            FEATURE_NAMES,
+            medians
+        )
     }
 
 
-def build_features_and_labels(
-    rows: List[Dict[str, Any]]
-) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
-    """
-    Construye features usando solo partidos PREVIOS al partido objetivo.
-    Después de crear cada ejemplo, actualiza el historial con ese resultado.
-    Esto evita data leakage.
-    """
-    normalized: List[Dict[str, Any]] = []
-    for row in rows:
-        match = normalize_match(row)
-        if match is not None:
-            normalized.append(match)
+def serialize_artifact(
+    model: LogisticRegression,
+    scaler: StandardScaler,
+    temperature: float,
+    accuracy: float,
+    logloss_value: float,
+    train_size: int,
+    calibration_size: int,
+    holdout_size: int,
+    defaults: dict[str, float],
+) -> dict[str, Any]:
 
-    # Supabase ya entrega por fecha, pero ordenamos otra vez por seguridad.
-    normalized.sort(key=lambda m: (m["starting_at"], m["id"]))
+    return {
+        "format_version": "NESTOR-MODEL-v1.0",
 
-    # team_id -> últimos 5 partidos como lista de (gf, ga, puntos)
-    history: Dict[int, List[Tuple[float, float, float]]] = {}
+        "model_type": "logistic_regression",
 
-    X: List[List[float]] = []
-    y: List[str] = []
-    meta: List[Dict[str, Any]] = []
+        "model_family": MODEL_FAMILY,
 
-    discarded_no_history = 0
+        "feature_schema_version": (
+            FEATURE_SCHEMA_VERSION
+        ),
 
-    for match in normalized:
-        home_id = match["home_team_id"]
-        away_id = match["away_team_id"]
+        "features": FEATURE_NAMES,
 
-        home_history = history.get(home_id, [])[-5:]
-        away_history = history.get(away_id, [])[-5:]
+        "classes": [
+            0,
+            1,
+            2
+        ],
 
-        # Para producir un ejemplo comparable, exigimos al menos 5 partidos
-        # previos de cada equipo.
-        if len(home_history) < 5 or len(away_history) < 5:
-            discarded_no_history += 1
-        else:
-            home_gf = sum(item[0] for item in home_history)
-            home_ga = sum(item[1] for item in home_history)
-            home_points = sum(item[2] for item in home_history)
-
-            away_gf = sum(item[0] for item in away_history)
-            away_ga = sum(item[1] for item in away_history)
-            away_points = sum(item[2] for item in away_history)
-
-            features = [
-                home_gf,
-                home_ga,
-                home_points,
-                away_gf,
-                away_ga,
-                away_points,
-                (home_gf - home_ga) - (away_gf - away_ga),
-                home_points - away_points,
-                1.0,
+        "coefficients": [
+            [
+                float(value)
+                for value in row
             ]
+            for row in model.coef_
+        ],
 
-            if match["home_goals"] > match["away_goals"]:
-                label = "H"
-            elif match["home_goals"] < match["away_goals"]:
-                label = "A"
-            else:
-                label = "D"
+        "intercept": [
+            float(value)
+            for value in model.intercept_
+        ],
 
-            X.append(features)
-            y.append(label)
-            meta.append(
-                {
-                    "match_id": match["id"],
-                    "starting_at": match["starting_at"],
-                    "league_id": match["league_id"],
-                    "season_id": match["season_id"],
-                }
-            )
+        "scaler_mean": [
+            float(value)
+            for value in scaler.mean_
+        ],
 
-        # IMPORTANTE: actualizar DESPUÉS de crear las features.
-        if match["home_goals"] > match["away_goals"]:
-            home_points_value = 3.0
-            away_points_value = 0.0
-        elif match["home_goals"] < match["away_goals"]:
-            home_points_value = 0.0
-            away_points_value = 3.0
+        "scaler_scale": [
+            float(value)
+            for value in scaler.scale_
+        ],
+
+        "calibration": {
+            "method": "temperature_scaling",
+            "temperature": float(
+                temperature
+            ),
+        },
+
+        "feature_defaults": defaults,
+
+        "validation_accuracy": float(
+            accuracy
+        ),
+
+        "validation_log_loss": float(
+            logloss_value
+        ),
+
+        "training_examples": int(
+            train_size
+        ),
+
+        "calibration_examples": int(
+            calibration_size
+        ),
+
+        "holdout_examples": int(
+            holdout_size
+        ),
+    }
+
+
+def probabilities_from_artifact(
+    artifact: dict[str, Any],
+    X: np.ndarray
+) -> np.ndarray:
+
+    coefficients = np.asarray(
+        artifact["coefficients"],
+        dtype=float
+    )
+
+    intercept = np.asarray(
+        artifact["intercept"],
+        dtype=float
+    )
+
+    mean = np.asarray(
+        artifact["scaler_mean"],
+        dtype=float
+    )
+
+    scale = np.asarray(
+        artifact["scaler_scale"],
+        dtype=float
+    )
+
+    scale = np.where(
+        np.abs(scale) < 1e-12,
+        1.0,
+        scale
+    )
+
+    Xs = (
+        X - mean
+    ) / scale
+
+    logits = (
+        Xs @ coefficients.T
+        + intercept
+    )
+
+    temperature = float(
+        artifact
+        .get("calibration", {})
+        .get("temperature", 1.0)
+    )
+
+    return softmax(
+        logits,
+        temperature
+    )
+
+
+def load_active_model() -> dict[str, Any] | None:
+
+    rows = supabase_get(
+        "model_versions",
+        {
+            "select": (
+                "version,"
+                "model_name,"
+                "trained_at,"
+                "training_matches,"
+                "metrics,"
+                "artifact,"
+                "active,"
+                "status,"
+                "parent_version,"
+                "feature_schema_version,"
+                "training_config,"
+                "validation_start,"
+                "validation_end"
+            ),
+            "active": "eq.true",
+            "order": "trained_at.desc",
+            "limit": "1",
+        },
+    )
+
+    if not rows:
+        return None
+
+    row = rows[0]
+
+    artifact = row.get(
+        "artifact"
+    )
+
+    if not isinstance(
+        artifact,
+        dict
+    ):
+
+        metrics = row.get(
+            "metrics"
+        )
+
+        if (
+            isinstance(metrics, dict)
+            and "coefficients" in metrics
+        ):
+            artifact = metrics
         else:
-            home_points_value = 1.0
-            away_points_value = 1.0
+            artifact = None
 
-        home_history = history.setdefault(home_id, [])
-        home_history.append(
-            (
-                float(match["home_goals"]),
-                float(match["away_goals"]),
-                home_points_value,
+    row["artifact"] = artifact
+
+    return row
+
+
+def current_holdout_evaluation(
+    active_row: dict[str, Any] | None,
+    X_holdout: np.ndarray,
+    y_holdout: np.ndarray
+) -> dict[str, float] | None:
+
+    if (
+        not active_row
+        or not isinstance(
+            active_row.get("artifact"),
+            dict
+        )
+    ):
+        return None
+
+    artifact = active_row["artifact"]
+
+    if (
+        artifact.get(
+            "feature_schema_version"
+        )
+        != FEATURE_SCHEMA_VERSION
+    ):
+        return None
+
+    try:
+
+        probabilities = probabilities_from_artifact(
+            artifact,
+            X_holdout
+        )
+
+        predictions = np.argmax(
+            probabilities,
+            axis=1
+        )
+
+        return {
+            "accuracy": float(
+                accuracy_score(
+                    y_holdout,
+                    predictions
+                )
+            ),
+
+            "log_loss": float(
+                log_loss(
+                    y_holdout,
+                    probabilities,
+                    labels=[0, 1, 2]
+                )
+            ),
+
+            "brier": brier_multiclass(
+                y_holdout,
+                probabilities
+            ),
+        }
+
+    except Exception as exc:
+
+        print(
+            "No se pudo reevaluar el "
+            "activo en el holdout actual: "
+            f"{exc}"
+        )
+
+        return None
+
+
+def save_candidate(
+    artifact: dict[str, Any],
+    active_row: dict[str, Any] | None,
+    holdout_ids: list[int],
+    candidate_metrics: dict[str, Any],
+    validation_start: str,
+    validation_end: str,
+) -> dict[str, Any]:
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    version = (
+        "NESTOR-1X2-"
+        + now.strftime(
+            "%Y%m%d-%H%M%S"
+        )
+    )
+
+    active_current = None
+
+    if active_row:
+
+        active_current = (
+            current_holdout_evaluation(
+                active_row,
+                np.asarray(
+                    candidate_metrics[
+                        "_X_holdout"
+                    ],
+                    dtype=float
+                ),
+                np.asarray(
+                    candidate_metrics[
+                        "_y_holdout"
+                    ],
+                    dtype=int
+                ),
             )
         )
-        if len(home_history) > 5:
-            del home_history[:-5]
 
-        away_history = history.setdefault(away_id, [])
-        away_history.append(
-            (
-                float(match["away_goals"]),
-                float(match["home_goals"]),
-                away_points_value,
+    candidate_public = {
+        key: value
+        for key, value in candidate_metrics.items()
+        if not key.startswith("_")
+    }
+
+    should_activate = False
+
+    reason = "challenger"
+
+    if active_current is None:
+
+        if active_row is None:
+
+            should_activate = True
+
+            reason = "first_nestor_model"
+
+        else:
+
+            reason = (
+                "challenger_protocol_not_comparable"
             )
+
+    else:
+
+        improvement = float(
+            active_current["log_loss"]
+            - candidate_public[
+                "holdout_log_loss"
+            ]
         )
-        if len(away_history) > 5:
-            del away_history[:-5]
 
-    print(f"Partidos válidos: {len(normalized)}")
-    print(f"Ejemplos utilizables: {len(X)}")
-    print(f"Partidos descartados por falta de historial: {discarded_no_history}")
+        if improvement > ACTIVATION_MARGIN:
 
-    if not X:
+            should_activate = True
+
+            reason = (
+                "improved_current_holdout_log_loss"
+            )
+
+        else:
+
+            reason = (
+                "not_better_than_active_on_same_holdout"
+            )
+
+    if should_activate:
+
+        supabase_patch(
+            "model_versions",
+            {
+                "active": "eq.true"
+            },
+            {
+                "active": False,
+                "status": "retired"
+            }
+        )
+
+    artifact[
+        "evaluation_dataset_fingerprint"
+    ] = dataset_fingerprint(
+        holdout_ids
+    )
+
+    artifact[
+        "model_protocol_version"
+    ] = MODEL_PROTOCOL_VERSION
+
+    row = {
+
+        "version": version,
+
+        "model_name": MODEL_NAME,
+
+        "trained_at": now.isoformat(),
+
+        "training_matches": int(
+            candidate_public[
+                "training_matches"
+            ]
+        ),
+
+        "metrics": {
+            **candidate_public,
+
+            "active_current_holdout": (
+                active_current
+            ),
+
+            "activation_reason": reason,
+
+            "protocol_version": (
+                MODEL_PROTOCOL_VERSION
+            ),
+
+            "evaluation_dataset_fingerprint": (
+                artifact[
+                    "evaluation_dataset_fingerprint"
+                ]
+            ),
+        },
+
+        "artifact": artifact,
+
+        "active": should_activate,
+
+        "status": (
+            "active"
+            if should_activate
+            else (
+                "rejected"
+                if active_current
+                else "challenger"
+            )
+        ),
+
+        "parent_version": (
+            active_row.get("version")
+            if active_row
+            else None
+        ),
+
+        "validation_start": validation_start,
+
+        "validation_end": validation_end,
+
+        "feature_schema_version": (
+            FEATURE_SCHEMA_VERSION
+        ),
+
+        "training_config": {
+
+            "window": WINDOW,
+
+            "model": MODEL_NAME,
+
+            "evaluation_protocol_version": (
+                MODEL_PROTOCOL_VERSION
+            ),
+
+            "activation_margin_log_loss": (
+                ACTIVATION_MARGIN
+            ),
+        },
+    }
+
+    supabase_post(
+        "model_versions",
+        row
+    )
+
+    return {
+
+        "version": version,
+
+        "active": should_activate,
+
+        "status": row["status"],
+
+        "activation_reason": reason,
+
+        "candidate_holdout": (
+            candidate_public
+        ),
+
+        "active_current_holdout": (
+            active_current
+        ),
+
+        "parent_version": (
+            row["parent_version"]
+        ),
+
+        "evaluation_dataset_fingerprint": (
+            artifact[
+                "evaluation_dataset_fingerprint"
+            ]
+        ),
+    }
+
+
+def main() -> None:
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        "NESTOR — MOTOR DE INTELIGENCIA "
+        "FUTBOLÍSTICA EVOLUTIVA"
+    )
+
+    print(
+        "Entrenamiento formal 1X2 v1.0"
+    )
+
+    print(
+        "============================================================"
+    )
+
+    raw_rows = load_finished_matches()
+
+    matches = normalize_matches(
+        raw_rows
+    )
+
+    print(
+        "Partidos terminados cargados: "
+        f"{len(matches)}"
+    )
+
+    if len(matches) < MIN_MATCHES:
+
         raise RuntimeError(
-            "No hay ejemplos utilizables. Necesitamos al menos 5 partidos previos "
-            "para cada equipo en una parte de la historia."
+            f"Se necesitan al menos "
+            f"{MIN_MATCHES} partidos terminados."
         )
 
-    return np.asarray(X, dtype=float), np.asarray(y), meta
+    X_list, y_list, match_ids = (
+        build_training_dataset(
+            matches
+        )
+    )
 
+    if len(X_list) < 60:
 
-def train_model(X: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
-    if len(X) < 50:
         raise RuntimeError(
-            f"Solo hay {len(X)} ejemplos utilizables. Se requieren al menos 50 para entrenar."
+            "No hay suficientes ejemplos "
+            "utilizables después del historial rodante."
         )
 
-    # División temporal: primeros 80% para entrenamiento, últimos 20% para validación.
-    split_index = int(len(X) * 0.80)
-    if split_index <= 0 or split_index >= len(X):
-        raise RuntimeError("No se pudo construir una división temporal 80/20 válida.")
+    X = np.asarray(
+        X_list,
+        dtype=float
+    )
 
-    X_train = X[:split_index]
-    y_train = y[:split_index]
-    X_valid = X[split_index:]
-    y_valid = y[split_index:]
+    y = np.asarray(
+        y_list,
+        dtype=int
+    )
 
-    unique_train = set(y_train.tolist())
-    if unique_train != {"H", "D", "A"}:
+    train_end = int(
+        len(X) * 0.60
+    )
+
+    calibration_end = int(
+        len(X) * 0.80
+    )
+
+    if (
+        train_end < 30
+        or calibration_end - train_end < 10
+        or len(X) - calibration_end < 10
+    ):
+
         raise RuntimeError(
-            f"El conjunto de entrenamiento no contiene las 3 clases H/D/A. Clases: {sorted(unique_train)}"
+            "El dataset no permite una "
+            "separación temporal 60/20/20 segura."
         )
+
+    X_train = X[:train_end]
+    y_train = y[:train_end]
+
+    X_cal = X[
+        train_end:calibration_end
+    ]
+    y_cal = y[
+        train_end:calibration_end
+    ]
+
+    X_holdout = X[
+        calibration_end:
+    ]
+    y_holdout = y[
+        calibration_end:
+    ]
+
+    holdout_ids = match_ids[
+        calibration_end:
+    ]
 
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_valid_scaled = scaler.transform(X_valid)
+
+    X_train_scaled = scaler.fit_transform(
+        X_train
+    )
+
+    X_cal_scaled = scaler.transform(
+        X_cal
+    )
+
+    X_holdout_scaled = scaler.transform(
+        X_holdout
+    )
 
     model = LogisticRegression(
         solver="lbfgs",
-        max_iter=2000,
+        max_iter=3000,
         C=1.0,
         random_state=42,
-        multi_class="auto",
-    )
-    model.fit(X_train_scaled, y_train)
-
-    valid_probabilities = model.predict_proba(X_valid_scaled)
-    valid_predictions = model.predict(X_valid_scaled)
-
-    accuracy = float(accuracy_score(y_valid, valid_predictions))
-    multiclass_log_loss = float(
-        log_loss(y_valid, valid_probabilities, labels=model.classes_)
     )
 
-    print("=== VALIDACIÓN DEL MODELO ===")
-    print(f"Entrenamiento: {len(X_train)}")
-    print(f"Validación: {len(X_valid)}")
-    print(f"Accuracy: {accuracy:.4f}")
-    print(f"Log loss: {multiclass_log_loss:.4f}")
-
-    # Copia de todos los elementos necesarios para reproducir la inferencia en Android/API.
-    serialized = {
-        "model_type": "multinomial_logistic_regression",
-        "feature_names": FEATURE_NAMES,
-        "features": FEATURE_NAMES,
-        "classes": [str(value) for value in model.classes_.tolist()],
-        "coef": model.coef_.tolist(),
-        "intercept": model.intercept_.tolist(),
-        "scaler_mean": scaler.mean_.tolist(),
-        "scaler_scale": scaler.scale_.tolist(),
-        "validation_accuracy": accuracy,
-        "validation_log_loss": multiclass_log_loss,
-        "training_examples": int(len(X_train)),
-        "validation_examples": int(len(X_valid)),
-    }
-
-    return {
-        "model": model,
-        "scaler": scaler,
-        "accuracy": accuracy,
-        "log_loss": multiclass_log_loss,
-        "serialized": serialized,
-        "training_examples": len(X_train),
-        "validation_examples": len(X_valid),
-    }
-
-
-def get_active_model_metric() -> float | None:
-    params = {
-        "select": "version,metrics,active",
-        "active": "eq.true",
-        "limit": 1,
-    }
-    response = supabase_request("GET", "model_versions", params=params)
-    try:
-        rows = response.json()
-    except ValueError as exc:
-        raise SupabaseError("JSON inválido al leer model_versions") from exc
-
-    if not isinstance(rows, list) or not rows:
-        return None
-
-    metrics = rows[0].get("metrics") or {}
-    if not isinstance(metrics, dict):
-        return None
-
-    value = metrics.get("validation_log_loss")
-    return parse_float(value)
-
-
-def save_model(result: Dict[str, Any]) -> Tuple[str, bool, float | None]:
-    now = datetime.now(timezone.utc)
-    version = f"1X2-{now.strftime('%Y%m%d-%H%M%S')}"
-
-    previous_metric = get_active_model_metric()
-    new_metric = float(result["log_loss"])
-
-    # Activar automáticamente el primer modelo.
-    should_activate = previous_metric is None or new_metric <= previous_metric
-
-    metrics = dict(result["serialized"])
-    metrics.update(
-        {
-            "validation_accuracy": float(result["accuracy"]),
-            "validation_log_loss": new_metric,
-            "trained_at": now.isoformat(),
-            "training_matches": int(result["training_examples"]),
-            "validation_examples": int(result["validation_examples"]),
-            "source": "supabase_existing_history_only",
-            "api_football_calls": 0,
-        }
+    model.fit(
+        X_train_scaled,
+        y_train
     )
 
-    payload = {
-        "version": version,
-        "model_name": MODEL_NAME,
-        "trained_at": now.isoformat(),
-        "training_matches": int(result["training_examples"]),
-        "metrics": metrics,
-        "active": bool(should_activate),
-    }
+    cal_logits = (
+        X_cal_scaled
+        @ model.coef_.T
+        + model.intercept_
+    )
 
-    # Si será el nuevo modelo activo, desactivamos los anteriores primero.
-    if should_activate:
-        supabase_request(
-            "PATCH",
-            "model_versions",
-            params={"active": "eq.true"},
-            payload={"active": False},
+    temperature = fit_temperature(
+        cal_logits,
+        y_cal
+    )
+
+    holdout_logits = (
+        X_holdout_scaled
+        @ model.coef_.T
+        + model.intercept_
+    )
+
+    holdout_probabilities = softmax(
+        holdout_logits,
+        temperature
+    )
+
+    holdout_predictions = np.argmax(
+        holdout_probabilities,
+        axis=1
+    )
+
+    accuracy = float(
+        accuracy_score(
+            y_holdout,
+            holdout_predictions
         )
-
-    response = supabase_request(
-        "POST",
-        "model_versions",
-        params={"on_conflict": "version"},
-        payload=payload,
-        headers={"Prefer": "resolution=merge-duplicates,return=representation"},
     )
 
-    if not response.ok:
-        raise SupabaseError(f"No se pudo guardar el modelo: HTTP {response.status_code}")
-
-    print("=== MODELO GUARDADO ===")
-    print(f"Version: {version}")
-    print(f"Accuracy: {result['accuracy']:.4f}")
-    print(f"Log loss: {new_metric:.4f}")
-    if previous_metric is None:
-        print("Modelo anterior: ninguno")
-    else:
-        print(f"Modelo anterior (log loss): {previous_metric:.10f}")
-    print(f"Activado: {should_activate}")
-
-    return version, should_activate, previous_metric
-
-
-def main() -> int:
-    print(f"{APP_NAME.upper()} - ENTRENAMIENTO REAL")
-    print("====================================")
-
-    rows = fetch_all_finished_matches()
-    print(f"Filas recibidas desde Supabase: {len(rows)}")
-
-    if not rows:
-        raise RuntimeError(
-            "Supabase no tiene partidos finalizados. Primero hay que cargar historial en public.matches."
+    holdout_logloss = float(
+        log_loss(
+            y_holdout,
+            holdout_probabilities,
+            labels=[0, 1, 2]
         )
+    )
 
-    X, y, meta = build_features_and_labels(rows)
-    print(f"Features: {X.shape[1]}")
-    print(f"Ejemplos totales: {len(X)}")
-    print(f"Primera fecha utilizable: {meta[0]['starting_at']}")
-    print(f"Última fecha utilizable: {meta[-1]['starting_at']}")
+    brier = brier_multiclass(
+        y_holdout,
+        holdout_probabilities
+    )
 
-    result = train_model(X, y)
-    save_model(result)
+    raw_holdout_probabilities = softmax(
+        holdout_logits,
+        1.0
+    )
 
-    print("====================================")
-    print("ENTRENAMIENTO TERMINADO CORRECTAMENTE")
-    print("Sin llamadas a API-Football durante el entrenamiento")
-    return 0
+    raw_logloss = float(
+        log_loss(
+            y_holdout,
+            raw_holdout_probabilities,
+            labels=[0, 1, 2]
+        )
+    )
+
+    defaults = feature_defaults(
+        X_train
+    )
+
+    artifact = serialize_artifact(
+        model,
+        scaler,
+        temperature,
+        accuracy,
+        holdout_logloss,
+        len(X_train),
+        len(X_cal),
+        len(X_holdout),
+        defaults,
+    )
+
+    active_row = load_active_model()
+
+    candidate_metrics: dict[str, Any] = {
+
+        "holdout_accuracy": accuracy,
+
+        "holdout_log_loss": (
+            holdout_logloss
+        ),
+
+        "holdout_brier": brier,
+
+        "raw_holdout_log_loss": (
+            raw_logloss
+        ),
+
+        "calibration_temperature": (
+            float(temperature)
+        ),
+
+        "training_matches": int(
+            len(X_train)
+        ),
+
+        "calibration_matches": int(
+            len(X_cal)
+        ),
+
+        "holdout_matches": int(
+            len(X_holdout)
+        ),
+
+        "usable_examples": int(
+            len(X)
+        ),
+
+        "total_finished_matches": int(
+            len(matches)
+        ),
+
+        "skipped_for_history": int(
+            len(matches) - len(X)
+        ),
+
+        "_X_holdout": (
+            X_holdout.tolist()
+        ),
+
+        "_y_holdout": (
+            y_holdout.tolist()
+        ),
+    }
+
+    match_dates = {
+        int(item["id"]): item["starting_at"]
+        for item in matches
+    }
+
+    validation_start = match_dates.get(
+        int(holdout_ids[0]),
+        matches[0]["starting_at"]
+    )
+
+    validation_end = match_dates.get(
+        int(holdout_ids[-1]),
+        matches[-1]["starting_at"]
+    )
+
+    result = save_candidate(
+        artifact,
+        active_row,
+        holdout_ids,
+        candidate_metrics,
+        validation_start,
+        validation_end,
+    )
+
+    print(
+        json.dumps(
+            result,
+            indent=2,
+            ensure_ascii=False
+        )
+    )
+
+    print(
+        "============================================================"
+    )
+
+    print(
+        "ENTRENAMIENTO NESTOR FINALIZADO"
+    )
+
+    print(
+        "============================================================"
+    )
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as exc:
-        print("ERROR DE ENTRENAMIENTO:", exc, file=sys.stderr)
-        raise
+    main()
