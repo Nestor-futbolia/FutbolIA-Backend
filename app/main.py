@@ -1,20 +1,17 @@
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
 
 from app.ai_predict import predict_match, load_active_model
-from app.ai_evaluate import router as ai_evaluate_router
 
 
 app = FastAPI(
-    title="Fútbol IA 2.0 API",
-    version="0.8.2"
+    title="FÚTBOL NESTOR IA API",
+    version="1.0.0"
 )
-
-app.include_router(ai_evaluate_router)
 
 BASE_URL = "https://v3.football.api-sports.io"
 
@@ -24,10 +21,7 @@ BASE_URL = "https://v3.football.api-sports.io"
 # ============================================================
 
 def get_api_football_key() -> str:
-    key = os.getenv(
-        "API_FOOTBALL_KEY",
-        ""
-    ).strip()
+    key = os.getenv("API_FOOTBALL_KEY", "").strip()
 
     if not key:
         raise RuntimeError(
@@ -65,7 +59,6 @@ def supabase_headers(
     key: str,
     prefer: Optional[str] = None
 ) -> dict[str, str]:
-
     headers = {
         "apikey": key,
         "Authorization": f"Bearer {key}",
@@ -95,10 +88,7 @@ async def football_get(
         else f"{BASE_URL}{endpoint}"
     )
 
-    async with httpx.AsyncClient(
-        timeout=60
-    ) as client:
-
+    async with httpx.AsyncClient(timeout=60) as client:
         response = await client.get(
             url,
             headers={
@@ -108,7 +98,6 @@ async def football_get(
         )
 
     if response.status_code >= 400:
-
         raise HTTPException(
             status_code=response.status_code,
             detail=(
@@ -119,11 +108,8 @@ async def football_get(
         )
 
     try:
-
         data = response.json()
-
     except Exception:
-
         raise HTTPException(
             status_code=502,
             detail=(
@@ -135,7 +121,6 @@ async def football_get(
     errors = data.get("errors")
 
     if errors:
-
         raise HTTPException(
             status_code=502,
             detail={
@@ -167,10 +152,7 @@ async def supabase_request(
         f"{supabase_url}/rest/v1/{table}"
     )
 
-    async with httpx.AsyncClient(
-        timeout=60
-    ) as client:
-
+    async with httpx.AsyncClient(timeout=60) as client:
         response = await client.request(
             method,
             url,
@@ -183,7 +165,6 @@ async def supabase_request(
         )
 
     if response.status_code >= 400:
-
         raise HTTPException(
             status_code=response.status_code,
             detail=(
@@ -197,7 +178,6 @@ async def supabase_request(
 
     try:
         return response.json()
-
     except Exception:
         return response.text
 
@@ -244,43 +224,9 @@ async def supabase_upsert(
 # ============================================================
 
 def utc_now() -> str:
-
     return datetime.now(
         timezone.utc
     ).isoformat()
-
-
-def parse_api_date(
-    value: Optional[str]
-) -> Optional[datetime]:
-
-    if not value:
-        return None
-
-    try:
-
-        normalized = value.replace(
-            "Z",
-            "+00:00"
-        )
-
-        dt = datetime.fromisoformat(
-            normalized
-        )
-
-        if dt.tzinfo is None:
-
-            dt = dt.replace(
-                tzinfo=timezone.utc
-            )
-
-        return dt.astimezone(
-            timezone.utc
-        )
-
-    except Exception:
-
-        return None
 
 
 def safe_int(
@@ -289,31 +235,12 @@ def safe_int(
 ) -> Optional[int]:
 
     try:
-
         if value is None:
             return default
 
         return int(value)
 
     except Exception:
-
-        return default
-
-
-def safe_float(
-    value: Any,
-    default: Optional[float] = None
-) -> Optional[float]:
-
-    try:
-
-        if value is None:
-            return default
-
-        return float(value)
-
-    except Exception:
-
         return default
 
 
@@ -335,49 +262,39 @@ def clean_text(
 
 @app.get("/")
 async def root():
-
     return {
         "ok": True,
-        "app": "Fútbol IA 2.0",
-        "version": "0.8.2",
+        "app": "FÚTBOL NESTOR IA",
+        "version": "1.0.0",
         "message": "Backend funcionando"
     }
 
 
 @app.get("/health")
 async def health():
-
     return {
         "ok": True,
         "status": "healthy",
-        "app": "Fútbol IA 2.0",
-        "version": "0.8.2",
+        "app": "FÚTBOL NESTOR IA",
+        "version": "1.0.0",
         "time": utc_now()
     }
 
 
 # ============================================================
-# PAÍSES
+# API-FOOTBALL
 # ============================================================
 
 @app.get("/countries")
 async def countries():
+    return await football_get("/countries")
 
-    return await football_get(
-        "/countries"
-    )
-
-
-# ============================================================
-# LIGAS
-# ============================================================
 
 @app.get("/leagues")
 async def leagues(
     country: Optional[str] = None,
     season: Optional[int] = None
 ):
-
     params: dict[str, Any] = {}
 
     if country:
@@ -392,10 +309,6 @@ async def leagues(
     )
 
 
-# ============================================================
-# FIXTURES
-# ============================================================
-
 @app.get("/fixtures")
 async def fixtures(
     league: Optional[int] = None,
@@ -406,7 +319,6 @@ async def fixtures(
     last: Optional[int] = None,
     status: Optional[str] = None
 ):
-
     params: dict[str, Any] = {}
 
     if league is not None:
@@ -436,50 +348,27 @@ async def fixtures(
     )
 
 
-# ============================================================
-# FIXTURE INDIVIDUAL
-# ============================================================
-
 @app.get("/fixtures/{fixture_id}")
-async def fixture(
-    fixture_id: int
-):
-
+async def fixture(fixture_id: int):
     return await football_get(
         "/fixtures",
-        {
-            "id": fixture_id
-        }
+        {"id": fixture_id}
     )
 
-
-# ============================================================
-# EQUIPO
-# ============================================================
 
 @app.get("/teams/{team_id}")
-async def team(
-    team_id: int
-):
-
+async def team(team_id: int):
     return await football_get(
         "/teams",
-        {
-            "id": team_id
-        }
+        {"id": team_id}
     )
 
-
-# ============================================================
-# STANDINGS
-# ============================================================
 
 @app.get("/standings")
 async def standings(
     league: int,
     season: int
 ):
-
     return await football_get(
         "/standings",
         {
@@ -489,10 +378,6 @@ async def standings(
     )
 
 
-# ============================================================
-# LESIONES
-# ============================================================
-
 @app.get("/injuries")
 async def injuries(
     league: Optional[int] = None,
@@ -500,7 +385,6 @@ async def injuries(
     fixture: Optional[int] = None,
     team: Optional[int] = None
 ):
-
     params: dict[str, Any] = {}
 
     if league is not None:
@@ -521,17 +405,12 @@ async def injuries(
     )
 
 
-# ============================================================
-# CUOTAS
-# ============================================================
-
 @app.get("/odds")
 async def odds(
     fixture: Optional[int] = None,
     league: Optional[int] = None,
     season: Optional[int] = None
 ):
-
     params: dict[str, Any] = {}
 
     if fixture is not None:
@@ -558,7 +437,6 @@ async def sync_league(
     league: int,
     season: int
 ):
-
     data = await football_get(
         "/leagues",
         {
@@ -567,13 +445,9 @@ async def sync_league(
         }
     )
 
-    response = data.get(
-        "response",
-        []
-    )
+    response = data.get("response", [])
 
     if not response:
-
         raise HTTPException(
             status_code=404,
             detail=(
@@ -584,27 +458,13 @@ async def sync_league(
 
     item = response[0]
 
-    league_info = item.get(
-        "league",
-        {}
-    )
+    league_info = item.get("league", {})
+    country_info = item.get("country", {})
+    seasons = item.get("seasons", [])
 
-    country_info = item.get(
-        "country",
-        {}
-    )
-
-    seasons = item.get(
-        "seasons",
-        []
-    )
-
-    league_id = league_info.get(
-        "id"
-    )
+    league_id = league_info.get("id")
 
     if league_id is None:
-
         raise HTTPException(
             status_code=502,
             detail=(
@@ -615,15 +475,9 @@ async def sync_league(
 
     league_payload = {
         "id": league_id,
-        "name": league_info.get(
-            "name"
-        ),
-        "country": country_info.get(
-            "name"
-        ),
-        "type": league_info.get(
-            "type"
-        ),
+        "name": league_info.get("name"),
+        "country": country_info.get("name"),
+        "type": league_info.get("type"),
         "active": True
     }
 
@@ -636,41 +490,26 @@ async def sync_league(
     selected_season = None
 
     for season_info in seasons:
-
-        if season_info.get(
-            "year"
-        ) == season:
-
+        if season_info.get("year") == season:
             selected_season = season_info
             break
 
     if selected_season is None:
-
         selected_season = {
             "year": season
         }
 
-    season_id = selected_season.get(
-        "id"
-    )
+    season_id = selected_season.get("id")
 
     if season_id is None:
-
-        season_id = (
-            league * 10000
-            + season
-        )
+        season_id = league * 10000 + season
 
     season_payload = {
         "id": season_id,
         "league_id": league_id,
         "name": str(season),
-        "starting_at": selected_season.get(
-            "start"
-        ),
-        "ending_at": selected_season.get(
-            "end"
-        )
+        "starting_at": selected_season.get("start"),
+        "ending_at": selected_season.get("end")
     }
 
     await supabase_upsert(
@@ -695,7 +534,6 @@ async def sync_teams(
     league: int,
     season: int
 ):
-
     await sync_league(
         league=league,
         season=season
@@ -709,46 +547,24 @@ async def sync_teams(
         }
     )
 
-    response = data.get(
-        "response",
-        []
-    )
-
+    response = data.get("response", [])
     saved = 0
 
     for item in response:
+        team_info = item.get("team", {})
+        venue_info = item.get("venue", {})
 
-        team_info = item.get(
-            "team",
-            {}
-        )
-
-        venue_info = item.get(
-            "venue",
-            {}
-        )
-
-        team_id = team_info.get(
-            "id"
-        )
+        team_id = team_info.get("id")
 
         if team_id is None:
             continue
 
         payload = {
             "id": team_id,
-            "name": team_info.get(
-                "name"
-            ),
-            "short_code": team_info.get(
-                "code"
-            ),
-            "country": team_info.get(
-                "country"
-            ),
-            "venue_name": venue_info.get(
-                "name"
-            ),
+            "name": team_info.get("name"),
+            "short_code": team_info.get("code"),
+            "country": team_info.get("country"),
+            "venue_name": venue_info.get("name"),
             "league_id": league
         }
 
@@ -770,7 +586,7 @@ async def sync_teams(
 
 
 # ============================================================
-# SINCRONIZAR FIXTURES DE TEMPORADA
+# SINCRONIZAR FIXTURES
 # ============================================================
 
 @app.get("/sync/fixtures")
@@ -778,7 +594,6 @@ async def sync_fixtures(
     league: int,
     season: int
 ):
-
     await sync_teams(
         league=league,
         season=season
@@ -792,13 +607,9 @@ async def sync_fixtures(
         }
     )
 
-    response = data.get(
-        "response",
-        []
-    )
+    response = data.get("response", [])
 
     if not response:
-
         raise HTTPException(
             status_code=404,
             detail="No se encontraron fixtures"
@@ -807,84 +618,37 @@ async def sync_fixtures(
     saved = 0
     skipped = 0
 
+    # El árbitro es opcional para guardar un partido.
+    # No se crea ningún registro en referees.
+    # Así evitamos el error de ID nulo en esa tabla.
     for item in response:
 
-        fixture_info = item.get(
-            "fixture",
-            {}
-        )
+        fixture_info = item.get("fixture", {})
+        league_info = item.get("league", {})
+        teams_info = item.get("teams", {})
+        goals_info = item.get("goals", {})
+        score_info = item.get("score", {})
 
-        league_info = item.get(
-            "league",
-            {}
-        )
+        fixture_id = fixture_info.get("id")
 
-        teams_info = item.get(
-            "teams",
-            {}
-        )
+        home_team = teams_info.get("home", {})
+        away_team = teams_info.get("away", {})
 
-        goals_info = item.get(
-            "goals",
-            {}
-        )
-
-        score_info = item.get(
-            "score",
-            {}
-        )
-
-        fixture_id = fixture_info.get(
-            "id"
-        )
-
-        home_team = teams_info.get(
-            "home",
-            {}
-        )
-
-        away_team = teams_info.get(
-            "away",
-            {}
-        )
-
-        home_team_id = home_team.get(
-            "id"
-        )
-
-        away_team_id = away_team.get(
-            "id"
-        )
+        home_team_id = home_team.get("id")
+        away_team_id = away_team.get("id")
 
         if (
             fixture_id is None
             or home_team_id is None
             or away_team_id is None
         ):
-
             skipped += 1
             continue
 
-        season_id = league_info.get(
-            "season"
-        )
+        season_id = league_info.get("season")
 
         if season_id is None:
-
-            season_id = (
-                league * 10000
-                + season
-            )
-
-        status_info = fixture_info.get(
-            "status",
-            {}
-        )
-
-        halftime = score_info.get(
-            "halftime",
-            {}
-        )
+            season_id = league * 10000 + season
 
         payload = {
             "id": fixture_id,
@@ -893,23 +657,23 @@ async def sync_fixtures(
             "home_team_id": home_team_id,
             "away_team_id": away_team_id,
             "referee_id": None,
-            "starting_at": fixture_info.get(
-                "date"
+            "starting_at": fixture_info.get("date"),
+            "status": (
+                fixture_info
+                .get("status", {})
+                .get("short")
             ),
-            "status": status_info.get(
-                "short"
+            "home_goals": goals_info.get("home"),
+            "away_goals": goals_info.get("away"),
+            "home_ht_goals": (
+                score_info
+                .get("halftime", {})
+                .get("home")
             ),
-            "home_goals": goals_info.get(
-                "home"
-            ),
-            "away_goals": goals_info.get(
-                "away"
-            ),
-            "home_ht_goals": halftime.get(
-                "home"
-            ),
-            "away_ht_goals": halftime.get(
-                "away"
+            "away_ht_goals": (
+                score_info
+                .get("halftime", {})
+                .get("away")
             ),
             "updated_at": utc_now()
         }
@@ -933,337 +697,21 @@ async def sync_fixtures(
 
 
 # ============================================================
-# SINCRONIZAR PRÓXIMOS PARTIDOS
-# ============================================================
-
-@app.get("/sync/upcoming")
-async def sync_upcoming(
-    limit: int = 10
-):
-
-    if limit < 1 or limit > 20:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "El límite debe estar "
-                "entre 1 y 20"
-            )
-        )
-
-    now_utc = datetime.now(
-        timezone.utc
-    )
-
-    today = now_utc.date()
-
-    dates = [
-        today,
-        today + timedelta(days=1)
-    ]
-
-    all_future_fixtures = []
-
-    for target_date in dates:
-
-        date_string = target_date.isoformat()
-
-        data = await football_get(
-            "/fixtures",
-            {
-                "date": date_string
-            }
-        )
-
-        response = data.get(
-            "response",
-            []
-        )
-
-        for item in response:
-
-            fixture_info = item.get(
-                "fixture",
-                {}
-            )
-
-            fixture_date = parse_api_date(
-                fixture_info.get(
-                    "date"
-                )
-            )
-
-            if (
-                fixture_date is not None
-                and fixture_date >= now_utc
-            ):
-
-                all_future_fixtures.append(
-                    item
-                )
-
-    all_future_fixtures.sort(
-        key=lambda item: (
-            parse_api_date(
-                item.get(
-                    "fixture",
-                    {}
-                ).get(
-                    "date"
-                )
-            )
-            or datetime.max.replace(
-                tzinfo=timezone.utc
-            )
-        )
-    )
-
-    unique_fixtures = []
-    seen_ids = set()
-
-    for item in all_future_fixtures:
-
-        fixture_id = item.get(
-            "fixture",
-            {}
-        ).get(
-            "id"
-        )
-
-        if fixture_id is None:
-            continue
-
-        if fixture_id in seen_ids:
-            continue
-
-        seen_ids.add(
-            fixture_id
-        )
-
-        unique_fixtures.append(
-            item
-        )
-
-        if len(unique_fixtures) >= limit:
-            break
-
-    saved = 0
-    skipped = 0
-
-    for item in unique_fixtures:
-
-        fixture_info = item.get(
-            "fixture",
-            {}
-        )
-
-        league_info = item.get(
-            "league",
-            {}
-        )
-
-        teams_info = item.get(
-            "teams",
-            {}
-        )
-
-        fixture_id = fixture_info.get(
-            "id"
-        )
-
-        league_id = league_info.get(
-            "id"
-        )
-
-        season_year = league_info.get(
-            "season"
-        )
-
-        home_team = teams_info.get(
-            "home",
-            {}
-        )
-
-        away_team = teams_info.get(
-            "away",
-            {}
-        )
-
-        home_team_id = home_team.get(
-            "id"
-        )
-
-        away_team_id = away_team.get(
-            "id"
-        )
-
-        if (
-            fixture_id is None
-            or league_id is None
-            or home_team_id is None
-            or away_team_id is None
-            or season_year is None
-        ):
-
-            skipped += 1
-            continue
-
-        # Liga
-
-        await supabase_upsert(
-            "leagues",
-            {
-                "id": league_id,
-                "name": league_info.get(
-                    "name"
-                ),
-                "country": league_info.get(
-                    "country"
-                ),
-                "type": league_info.get(
-                    "type"
-                ),
-                "active": True
-            },
-            "id"
-        )
-
-        # Temporada
-
-        season_id = (
-            league_id * 10000
-            + season_year
-        )
-
-        await supabase_upsert(
-            "seasons",
-            {
-                "id": season_id,
-                "league_id": league_id,
-                "name": str(
-                    season_year
-                )
-            },
-            "id"
-        )
-
-        # Equipo local
-
-        await supabase_upsert(
-            "teams",
-            {
-                "id": home_team_id,
-                "name": home_team.get(
-                    "name"
-                ),
-                "short_code": home_team.get(
-                    "code"
-                ),
-                "country": home_team.get(
-                    "country"
-                ),
-                "venue_name": None,
-                "league_id": league_id
-            },
-            "id"
-        )
-
-        # Equipo visitante
-
-        await supabase_upsert(
-            "teams",
-            {
-                "id": away_team_id,
-                "name": away_team.get(
-                    "name"
-                ),
-                "short_code": away_team.get(
-                    "code"
-                ),
-                "country": away_team.get(
-                    "country"
-                ),
-                "venue_name": None,
-                "league_id": league_id
-            },
-            "id"
-        )
-
-        # Partido
-
-        status_info = fixture_info.get(
-            "status",
-            {}
-        )
-
-        await supabase_upsert(
-            "matches",
-            {
-                "id": fixture_id,
-                "league_id": league_id,
-                "season_id": season_id,
-                "home_team_id": home_team_id,
-                "away_team_id": away_team_id,
-                "referee_id": None,
-                "starting_at": fixture_info.get(
-                    "date"
-                ),
-                "status": status_info.get(
-                    "short"
-                ),
-                "home_goals": None,
-                "away_goals": None,
-                "home_ht_goals": None,
-                "away_ht_goals": None,
-                "updated_at": utc_now()
-            },
-            "id"
-        )
-
-        saved += 1
-
-    return {
-        "ok": True,
-        "current_time_utc": now_utc.isoformat(),
-        "dates_checked": [
-            date.isoformat()
-            for date in dates
-        ],
-        "requested_limit": limit,
-        "future_fixtures_found": len(
-            all_future_fixtures
-        ),
-        "selected": len(
-            unique_fixtures
-        ),
-        "saved": saved,
-        "skipped": skipped
-    }
-
-
-# ============================================================
-# ESTADÍSTICAS DE UN PARTIDO
+# SINCRONIZAR ESTADÍSTICAS DE UN PARTIDO
 # ============================================================
 
 @app.get("/sync/statistics")
 async def sync_statistics(
     fixture: int
 ):
-
     data = await football_get(
         "/fixtures/statistics",
-        {
-            "fixture": fixture
-        }
+        {"fixture": fixture}
     )
 
-    response = data.get(
-        "response",
-        []
-    )
+    response = data.get("response", [])
 
     if not response:
-
         raise HTTPException(
             status_code=404,
             detail=(
@@ -1276,14 +724,8 @@ async def sync_statistics(
 
     for team_block in response:
 
-        team_info = team_block.get(
-            "team",
-            {}
-        )
-
-        team_id = team_info.get(
-            "id"
-        )
+        team_info = team_block.get("team", {})
+        team_id = team_info.get("id")
 
         if team_id is None:
             continue
@@ -1299,9 +741,7 @@ async def sync_statistics(
                 stat.get("type")
             )
 
-            value = stat.get(
-                "value"
-            )
+            value = stat.get("value")
 
             if not stat_type:
                 continue
@@ -1309,52 +749,33 @@ async def sync_statistics(
             numeric_value = None
             text_value = None
 
-            if isinstance(
-                value,
-                (int, float)
-            ):
+            if isinstance(value, (int, float)):
+                numeric_value = float(value)
 
-                numeric_value = float(
-                    value
-                )
-
-            elif isinstance(
-                value,
-                str
-            ):
-
+            elif isinstance(value, str):
                 cleaned = (
                     value
-                    .replace(
-                        "%",
-                        ""
-                    )
-                    .replace(
-                        ",",
-                        "."
-                    )
+                    .replace("%", "")
+                    .replace(",", ".")
                     .strip()
                 )
 
                 try:
-
-                    numeric_value = float(
-                        cleaned
-                    )
-
+                    numeric_value = float(cleaned)
                 except Exception:
-
                     text_value = value
+
+            payload = {
+                "match_id": fixture,
+                "team_id": team_id,
+                "stat_type": stat_type,
+                "value_numeric": numeric_value,
+                "value_text": text_value
+            }
 
             await supabase_upsert(
                 "match_statistics",
-                {
-                    "match_id": fixture,
-                    "team_id": team_id,
-                    "stat_type": stat_type,
-                    "value_numeric": numeric_value,
-                    "value_text": text_value
-                },
+                payload,
                 "match_id,team_id,stat_type"
             )
 
@@ -1369,7 +790,7 @@ async def sync_statistics(
 
 
 # ============================================================
-# OBTENER FIXTURES CON ESTADÍSTICAS
+# FIXTURES QUE YA TIENEN ESTADÍSTICAS
 # ============================================================
 
 async def get_saved_statistic_fixture_ids() -> set[int]:
@@ -1385,22 +806,18 @@ async def get_saved_statistic_fixture_ids() -> set[int]:
     result: set[int] = set()
 
     for row in rows:
-
         match_id = safe_int(
             row.get("match_id")
         )
 
         if match_id is not None:
-
-            result.add(
-                match_id
-            )
+            result.add(match_id)
 
     return result
 
 
 # ============================================================
-# ESTADÍSTICAS POR LOTES
+# SINCRONIZACIÓN DE ESTADÍSTICAS POR LOTES
 # ============================================================
 
 @app.get("/sync/statistics/batch")
@@ -1409,9 +826,7 @@ async def sync_statistics_batch(
     season: int,
     limit: int = 5
 ):
-
     if limit < 1 or limit > 10:
-
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1428,13 +843,9 @@ async def sync_statistics_batch(
         }
     )
 
-    fixtures_data = data.get(
-        "response",
-        []
-    )
+    fixtures_data = data.get("response", [])
 
     if not fixtures_data:
-
         raise HTTPException(
             status_code=404,
             detail=(
@@ -1452,39 +863,24 @@ async def sync_statistics_batch(
     finished_fixtures = []
 
     for item in fixtures_data:
-
-        fixture_info = item.get(
-            "fixture",
-            {}
-        )
-
-        status_info = fixture_info.get(
-            "status",
-            {}
-        )
-
-        status_short = status_info.get(
-            "short"
+        fixture_info = item.get("fixture", {})
+        status_short = (
+            fixture_info
+            .get("status", {})
+            .get("short")
         )
 
         if status_short in finished_statuses:
-
-            fixture_id = fixture_info.get(
-                "id"
-            )
+            fixture_id = fixture_info.get("id")
 
             if fixture_id is not None:
-
                 finished_fixtures.append({
                     "id": fixture_id,
                     "status": status_short,
-                    "date": fixture_info.get(
-                        "date"
-                    )
+                    "date": fixture_info.get("date")
                 })
 
     if not finished_fixtures:
-
         raise HTTPException(
             status_code=404,
             detail=(
@@ -1500,23 +896,18 @@ async def sync_statistics_batch(
     pending_fixtures = [
         item
         for item in finished_fixtures
-        if item["id"]
-        not in saved_fixture_ids
+        if item["id"] not in saved_fixture_ids
     ]
 
-    selected_fixtures = (
-        pending_fixtures[:limit]
-    )
+    selected_fixtures = pending_fixtures[:limit]
 
     processed = []
     failed = []
 
     for item in selected_fixtures:
-
         fixture_id = item["id"]
 
         try:
-
             result = await sync_statistics(
                 fixture=fixture_id
             )
@@ -1528,7 +919,6 @@ async def sync_statistics_batch(
             })
 
         except HTTPException as exc:
-
             failed.append({
                 "fixture": fixture_id,
                 "status": "error",
@@ -1537,7 +927,6 @@ async def sync_statistics_batch(
             })
 
         except Exception as exc:
-
             failed.append({
                 "fixture": fixture_id,
                 "status": "error",
@@ -1561,12 +950,8 @@ async def sync_statistics_batch(
         "selected": len(
             selected_fixtures
         ),
-        "processed": len(
-            processed
-        ),
-        "failed": len(
-            failed
-        ),
+        "processed": len(processed),
+        "failed": len(failed),
         "details": {
             "processed": processed,
             "failed": failed
@@ -1582,7 +967,6 @@ async def sync_statistics_batch(
 async def ai_status():
 
     try:
-
         model = await load_active_model()
 
         metrics = model.get(
@@ -1606,15 +990,36 @@ async def ai_status():
                 "training_matches"
             ),
             "validation_accuracy": metrics.get(
-                "validation_accuracy"
+                "holdout_accuracy",
+                metrics.get("validation_accuracy")
             ),
             "validation_log_loss": metrics.get(
-                "validation_log_loss"
-            )
+                "holdout_log_loss",
+                metrics.get("validation_log_loss")
+            ),
+            "validation_brier": metrics.get(
+                "holdout_brier"
+            ),
+            "feature_schema_version": (
+                model.get("feature_schema_version")
+                or (model.get("artifact") or {}).get("feature_schema_version")
+            ),
+            "evaluation_protocol_version": (
+                metrics.get("protocol_version")
+                or (model.get("artifact") or {}).get("model_protocol_version")
+            ),
+            "status": model.get("status"),
+            "inference_ready": bool(model.get("inference_ready")),
+            "inference_compatibility": model.get("inference_compatibility"),
+            "inference_model_type": (
+                (model.get("artifact") or {}).get("model_type")
+            ),
+            "inference_classes": (
+                (model.get("artifact") or {}).get("classes")
+            ),
         }
 
     except Exception as exc:
-
         raise HTTPException(
             status_code=503,
             detail=str(exc)
@@ -1622,10 +1027,7 @@ async def ai_status():
 
 
 # ============================================================
-# IA — PREDICCIÓN INDIVIDUAL 1X2
-#
-# IMPORTANTE:
-# Esta ruta va DESPUÉS de /ai/predict/upcoming.
+# IA — PREDICCIÓN 1X2
 # ============================================================
 
 @app.get("/ai/predict/{match_id}")
@@ -1634,7 +1036,6 @@ async def ai_predict(
 ):
 
     try:
-
         result = await predict_match(
             match_id
         )
@@ -1642,390 +1043,7 @@ async def ai_predict(
         return result
 
     except Exception as exc:
-
         raise HTTPException(
             status_code=400,
             detail=str(exc)
         )
-
-
-# ============================================================
-# IA — PREDICCIONES PRÓXIMAS
-#
-# ESTA ES LA RUTA QUE USA LA APK.
-#
-# Si las predicciones ya existen en Supabase:
-#     NO las vuelve a crear.
-#     Las LEE y las devuelve.
-#
-# Si faltan:
-#     las genera mediante predict_match()
-#     y después vuelve a leerlas.
-# ============================================================
-
-@app.get("/ai/predict/upcoming")
-async def ai_predict_upcoming(
-    limit: int = 10
-):
-
-    if limit < 1 or limit > 20:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "El límite debe estar "
-                "entre 1 y 20"
-            )
-        )
-
-    now = datetime.now(
-        timezone.utc
-    )
-
-    # --------------------------------------------------------
-    # Buscar próximos partidos guardados.
-    # --------------------------------------------------------
-
-    matches = await supabase_get(
-        "matches",
-        {
-            "select": (
-                "id,"
-                "starting_at,"
-                "status,"
-                "home_team_id,"
-                "away_team_id"
-            ),
-            "starting_at": (
-                f"gt.{now.isoformat()}"
-            ),
-            "order": "starting_at.asc",
-            "limit": str(limit)
-        }
-    )
-
-    if not matches:
-
-        return {
-            "ok": True,
-            "current_time_utc": now.isoformat(),
-            "selected": 0,
-            "predicted": 0,
-            "skipped": 0,
-            "failed": 0,
-            "details": []
-        }
-
-    match_ids = [
-        int(match["id"])
-        for match in matches
-        if match.get("id") is not None
-    ]
-
-    if not match_ids:
-
-        return {
-            "ok": True,
-            "current_time_utc": now.isoformat(),
-            "selected": 0,
-            "predicted": 0,
-            "skipped": 0,
-            "failed": 0,
-            "details": []
-        }
-
-    ids_filter = ",".join(
-        str(match_id)
-        for match_id in match_ids
-    )
-
-    # --------------------------------------------------------
-    # Función interna para cargar predicciones existentes.
-    # --------------------------------------------------------
-
-    async def load_existing_predictions():
-
-        rows = await supabase_get(
-            "predictions",
-            {
-                "select": (
-                    "id,"
-                    "match_id,"
-                    "model_version,"
-                    "market,"
-                    "selection,"
-                    "probability,"
-                    "predicted_at"
-                ),
-                "match_id": (
-                    f"in.({ids_filter})"
-                ),
-                "market": "eq.1X2",
-                "order": "predicted_at.desc",
-                "limit": "1000"
-            }
-        )
-
-        latest = {}
-
-        for row in rows:
-
-            match_id = row.get(
-                "match_id"
-            )
-
-            selection = row.get(
-                "selection"
-            )
-
-            if (
-                match_id is None
-                or selection is None
-            ):
-                continue
-
-            key = (
-                int(match_id),
-                str(selection).upper()
-            )
-
-            if key not in latest:
-
-                latest[key] = row
-
-        return latest
-
-    # --------------------------------------------------------
-    # PRIMERO: leer las predicciones que YA EXISTEN.
-    # --------------------------------------------------------
-
-    latest_predictions = (
-        await load_existing_predictions()
-    )
-
-    generated = 0
-    failed = 0
-
-    # --------------------------------------------------------
-    # SEGUNDO: generar solamente las que faltan.
-    # --------------------------------------------------------
-
-    for match in matches:
-
-        match_id = int(
-            match["id"]
-        )
-
-        home_exists = (
-            (match_id, "HOME")
-            in latest_predictions
-        )
-
-        draw_exists = (
-            (match_id, "DRAW")
-            in latest_predictions
-        )
-
-        away_exists = (
-            (match_id, "AWAY")
-            in latest_predictions
-        )
-
-        complete = (
-            home_exists
-            and draw_exists
-            and away_exists
-        )
-
-        if complete:
-            continue
-
-        try:
-
-            await predict_match(
-                match_id
-            )
-
-            generated += 1
-
-        except Exception:
-
-            failed += 1
-
-    # --------------------------------------------------------
-    # TERCERO: volver a leer Supabase.
-    #
-    # Esto es importante porque predict_match()
-    # acaba de guardar las filas nuevas.
-    # --------------------------------------------------------
-
-    latest_predictions = (
-        await load_existing_predictions()
-    )
-
-    # --------------------------------------------------------
-    # CUARTO: construir respuesta para la APK.
-    # --------------------------------------------------------
-
-    details = []
-
-    for match in matches:
-
-        match_id = int(
-            match["id"]
-        )
-
-        home_row = latest_predictions.get(
-            (match_id, "HOME")
-        )
-
-        draw_row = latest_predictions.get(
-            (match_id, "DRAW")
-        )
-
-        away_row = latest_predictions.get(
-            (match_id, "AWAY")
-        )
-
-        # Si no existen las tres probabilidades,
-        # no enviamos un resultado falso.
-        if not (
-            home_row
-            and draw_row
-            and away_row
-        ):
-
-            failed += 1
-
-            details.append({
-                "match_id": match_id,
-                "starting_at": match.get(
-                    "starting_at"
-                ),
-                "ok": False,
-                "status": "missing_predictions",
-                "reason": (
-                    "No existen las tres "
-                    "predicciones 1X2"
-                )
-            })
-
-            continue
-
-        home_probability = safe_float(
-            home_row.get(
-                "probability"
-            ),
-            0.0
-        ) or 0.0
-
-        draw_probability = safe_float(
-            draw_row.get(
-                "probability"
-            ),
-            0.0
-        ) or 0.0
-
-        away_probability = safe_float(
-            away_row.get(
-                "probability"
-            ),
-            0.0
-        ) or 0.0
-
-        probabilities = {
-            "HOME": home_probability,
-            "DRAW": draw_probability,
-            "AWAY": away_probability
-        }
-
-        prediction = max(
-            probabilities,
-            key=probabilities.get
-        )
-
-        prediction_probability = (
-            probabilities[prediction]
-        )
-
-        model_version = (
-            home_row.get(
-                "model_version"
-            )
-            or draw_row.get(
-                "model_version"
-            )
-            or away_row.get(
-                "model_version"
-            )
-            or "N/D"
-        )
-
-        details.append({
-            "match_id": match_id,
-            "starting_at": match.get(
-                "starting_at"
-            ),
-            "ok": True,
-            "status": "predicted",
-
-            "prediction": prediction,
-
-            "prediction_probability": round(
-                prediction_probability,
-                6
-            ),
-
-            "prediction_percentage": round(
-                prediction_probability * 100,
-                2
-            ),
-
-            "probabilities": {
-                "home": round(
-                    home_probability,
-                    6
-                ),
-                "draw": round(
-                    draw_probability,
-                    6
-                ),
-                "away": round(
-                    away_probability,
-                    6
-                )
-            },
-
-            "percentages": {
-                "home": round(
-                    home_probability * 100,
-                    2
-                ),
-                "draw": round(
-                    draw_probability * 100,
-                    2
-                ),
-                "away": round(
-                    away_probability * 100,
-                    2
-                )
-            },
-
-            "model_version": model_version
-        })
-
-    predicted_count = sum(
-        1
-        for item in details
-        if item.get("ok") is True
-    )
-
-    return {
-        "ok": True,
-        "current_time_utc": now.isoformat(),
-        "selected": len(matches),
-        "predicted": predicted_count,
-        "skipped": 0,
-        "failed": failed,
-        "details": details
-    }
