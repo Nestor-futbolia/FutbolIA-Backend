@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import os
-from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -127,6 +126,7 @@ def _validate_parameter_shapes(
             raise RuntimeError(
                 "La matriz de coeficientes no coincide con FEATURE_NAMES."
             )
+
         for value in row:
             if not math.isfinite(float(value)):
                 raise RuntimeError(
@@ -175,10 +175,14 @@ def _validate_temperature(artifact: dict[str, Any]) -> float:
     calibration = artifact.get("calibration", {})
 
     if not isinstance(calibration, dict):
-        raise RuntimeError("El bloque calibration del artefacto es inválido.")
+        raise RuntimeError(
+            "El bloque calibration del artefacto es inválido."
+        )
 
     try:
-        temperature = float(calibration.get("temperature", 1.0))
+        temperature = float(
+            calibration.get("temperature", 1.0)
+        )
     except (TypeError, ValueError) as exc:
         raise RuntimeError(
             "La temperatura de calibración del artefacto es inválida."
@@ -198,14 +202,21 @@ def _native_artifact_is_compatible(
     if artifact.get("model_type") != "logistic_regression":
         return False
 
-    if artifact.get("model_family") not in (None, MODEL_FAMILY):
+    if artifact.get("model_family") not in (
+        None,
+        MODEL_FAMILY,
+    ):
         return False
 
     if artifact.get("features") != FEATURE_NAMES:
         return False
 
     schema = artifact.get("feature_schema_version")
-    if schema not in (None, FEATURE_SCHEMA_VERSION):
+
+    if schema not in (
+        None,
+        FEATURE_SCHEMA_VERSION,
+    ):
         return False
 
     if artifact.get("classes") != EXPECTED_CLASSES:
@@ -218,7 +229,9 @@ def _native_artifact_is_compatible(
             artifact.get("scaler_mean"),
             artifact.get("scaler_scale"),
         )
+
         _validate_temperature(artifact)
+
     except Exception:
         return False
 
@@ -255,20 +268,34 @@ def _convert_legacy_artifact(
         for row in legacy["coefficients"]
     ]
 
-    intercept = [float(value) for value in legacy["intercept"]]
+    intercept = [
+        float(value)
+        for value in legacy["intercept"]
+    ]
 
-    scaler_mean = [float(value) for value in legacy["scaler_mean"]]
-    scaler_scale = [float(value) for value in legacy["scaler_scale"]]
+    scaler_mean = [
+        float(value)
+        for value in legacy["scaler_mean"]
+    ]
+
+    scaler_scale = [
+        float(value)
+        for value in legacy["scaler_scale"]
+    ]
 
     # Legacy:
     #   A = away
     #   D = draw
     #   H = home
+    #
     # NESTOR:
     #   0 = home
     #   1 = draw
     #   2 = away
-    # Therefore [A,D,H] -> [H,D,A] -> [0,1,2].
+    #
+    # Therefore:
+    # [A,D,H] -> [H,D,A] -> [0,1,2]
+
     legacy_to_nestor = [2, 1, 0]
 
     converted_coefficients = [
@@ -283,7 +310,8 @@ def _convert_legacy_artifact(
 
     # El modelo legacy no guardaba feature_defaults.
     # Usamos el centro de entrenamiento del scaler como fallback
-    # para equipos sin historial previo, manteniendo la escala del modelo.
+    # para equipos sin historial previo.
+
     feature_defaults = {
         feature_name: float(value)
         for feature_name, value in zip(
@@ -308,43 +336,82 @@ def _convert_legacy_artifact(
             "temperature": 1.0,
         },
         "feature_defaults": feature_defaults,
-        "legacy_source_model_type": legacy.get("model_type"),
-        "legacy_source_classes": list(LEGACY_CLASSES),
-        "legacy_class_conversion": "[A,D,H] -> [H,D,A] -> [0,1,2]",
+        "legacy_source_model_type": legacy.get(
+            "model_type"
+        ),
+        "legacy_source_classes": list(
+            LEGACY_CLASSES
+        ),
+        "legacy_class_conversion": (
+            "[A,D,H] -> [H,D,A] -> [0,1,2]"
+        ),
     }
 
 
 def normalize_model_artifact(
     row: dict[str, Any],
 ) -> tuple[dict[str, Any], str]:
+
     artifact = row.get("artifact")
 
-    if isinstance(artifact, dict) and _native_artifact_is_compatible(artifact):
-        # Normalizamos también el schema para que inference tenga un
-        # formato estable aunque el campo no exista en versiones anteriores.
+    if (
+        isinstance(artifact, dict)
+        and _native_artifact_is_compatible(artifact)
+    ):
         normalized = dict(artifact)
-        normalized.setdefault("model_family", MODEL_FAMILY)
-        normalized.setdefault("feature_schema_version", FEATURE_SCHEMA_VERSION)
+
+        normalized.setdefault(
+            "model_family",
+            MODEL_FAMILY,
+        )
+
+        normalized.setdefault(
+            "feature_schema_version",
+            FEATURE_SCHEMA_VERSION,
+        )
+
         return normalized, "strict_native"
 
     metrics = row.get("metrics")
+
     if not isinstance(metrics, dict):
         raise RuntimeError(
             "El modelo activo no contiene artifact ni metrics compatibles."
         )
 
-    # El campeón actual histórico guarda el modelo dentro de metrics
-    # usando el formato multinomial_logistic_regression.
-    if metrics.get("model_type") == "multinomial_logistic_regression":
-        return _convert_legacy_artifact(metrics), "legacy_multinomial_bridge"
+    # El campeón histórico guarda el modelo dentro
+    # de metrics usando el formato legacy.
 
-    # Compatibilidad adicional con modelos antiguos que guardaron el artifact
-    # nativo directamente dentro de metrics.
+    if metrics.get(
+        "model_type"
+    ) == "multinomial_logistic_regression":
+
+        return (
+            _convert_legacy_artifact(metrics),
+            "legacy_multinomial_bridge",
+        )
+
+    # Compatibilidad adicional con modelos antiguos
+    # que guardaron el artifact nativo dentro de metrics.
+
     if _native_artifact_is_compatible(metrics):
+
         normalized = dict(metrics)
-        normalized.setdefault("model_family", MODEL_FAMILY)
-        normalized.setdefault("feature_schema_version", FEATURE_SCHEMA_VERSION)
-        return normalized, "native_metrics_bridge"
+
+        normalized.setdefault(
+            "model_family",
+            MODEL_FAMILY,
+        )
+
+        normalized.setdefault(
+            "feature_schema_version",
+            FEATURE_SCHEMA_VERSION,
+        )
+
+        return (
+            normalized,
+            "native_metrics_bridge",
+        )
 
     raise RuntimeError(
         "El modelo activo no contiene un artefacto 1X2 compatible con NESTOR."
@@ -357,6 +424,7 @@ def normalize_model_artifact(
 
 
 async def load_active_model() -> dict[str, Any]:
+
     rows = await supabase_get(
         "model_versions",
         {
@@ -377,7 +445,11 @@ async def load_active_model() -> dict[str, Any]:
         )
 
     if len(rows) > 1:
-        versions = [str(row.get("version")) for row in rows]
+        versions = [
+            str(row.get("version"))
+            for row in rows
+        ]
+
         raise RuntimeError(
             "Hay más de un modelo activo en model_versions: "
             + ", ".join(versions)
@@ -385,10 +457,16 @@ async def load_active_model() -> dict[str, Any]:
 
     row = rows[0]
 
-    artifact, compatibility = normalize_model_artifact(row)
+    artifact, compatibility = normalize_model_artifact(
+        row
+    )
 
     row["artifact"] = artifact
-    row["inference_compatibility"] = compatibility
+
+    row["inference_compatibility"] = (
+        compatibility
+    )
+
     row["inference_ready"] = True
 
     return row
@@ -403,26 +481,60 @@ def _softmax(
     logits: list[float],
     temperature: float = 1.0,
 ) -> list[float]:
-    t = max(float(temperature), 0.05)
-    z = [value / t for value in logits]
+
+    t = max(
+        float(temperature),
+        0.05,
+    )
+
+    z = [
+        value / t
+        for value in logits
+    ]
+
     max_z = max(z)
-    exps = [math.exp(value - max_z) for value in z]
+
+    exps = [
+        math.exp(value - max_z)
+        for value in z
+    ]
+
     total = sum(exps)
 
-    if total <= 0.0 or not math.isfinite(total):
-        raise RuntimeError("No se pudieron calcular las probabilidades del modelo.")
+    if (
+        total <= 0.0
+        or not math.isfinite(total)
+    ):
+        raise RuntimeError(
+            "No se pudieron calcular las probabilidades del modelo."
+        )
 
-    return [value / total for value in exps]
+    return [
+        value / total
+        for value in exps
+    ]
 
 
 def _artifact_logits(
     artifact: dict[str, Any],
     features: list[float],
 ) -> list[float]:
-    coefficients = artifact.get("coefficients")
-    intercept = artifact.get("intercept")
-    mean = artifact.get("scaler_mean")
-    scale = artifact.get("scaler_scale")
+
+    coefficients = artifact.get(
+        "coefficients"
+    )
+
+    intercept = artifact.get(
+        "intercept"
+    )
+
+    mean = artifact.get(
+        "scaler_mean"
+    )
+
+    scale = artifact.get(
+        "scaler_scale"
+    )
 
     _validate_parameter_shapes(
         coefficients,
@@ -431,7 +543,9 @@ def _artifact_logits(
         scale,
     )
 
-    if len(features) != len(FEATURE_NAMES):
+    if len(features) != len(
+        FEATURE_NAMES
+    ):
         raise RuntimeError(
             "El vector de features de inferencia no coincide con el esquema NESTOR."
         )
@@ -439,20 +553,34 @@ def _artifact_logits(
     logits: list[float] = []
 
     for class_index in range(3):
-        value = float(intercept[class_index])
 
-        for feature_index, feature_value in enumerate(features):
-            denominator = float(scale[feature_index])
+        value = float(
+            intercept[class_index]
+        )
+
+        for feature_index, feature_value in enumerate(
+            features
+        ):
+
+            denominator = float(
+                scale[feature_index]
+            )
+
             if abs(denominator) < 1e-12:
                 denominator = 1.0
 
             standardized = (
-                float(feature_value) - float(mean[feature_index])
+                float(feature_value)
+                - float(mean[feature_index])
             ) / denominator
 
             value += (
                 standardized
-                * float(coefficients[class_index][feature_index])
+                * float(
+                    coefficients[class_index][
+                        feature_index
+                    ]
+                )
             )
 
         if not math.isfinite(value):
@@ -469,9 +597,23 @@ def _artifact_probabilities(
     artifact: dict[str, Any],
     features: list[float],
 ) -> tuple[list[float], float]:
-    logits = _artifact_logits(artifact, features)
-    temperature = _validate_temperature(artifact)
-    return _softmax(logits, temperature), temperature
+
+    logits = _artifact_logits(
+        artifact,
+        features,
+    )
+
+    temperature = _validate_temperature(
+        artifact
+    )
+
+    return (
+        _softmax(
+            logits,
+            temperature,
+        ),
+        temperature,
+    )
 
 
 # ============================================================
@@ -479,69 +621,141 @@ def _artifact_probabilities(
 # ============================================================
 
 
-def _entropy(probabilities: list[float]) -> float:
+def _entropy(
+    probabilities: list[float],
+) -> float:
+
     entropy = 0.0
 
     for value in probabilities:
-        if value > 0:
-            entropy -= value * math.log(value)
 
-    return float(entropy / math.log(len(probabilities)))
+        if value > 0:
+            entropy -= (
+                value
+                * math.log(value)
+            )
+
+    return float(
+        entropy
+        / math.log(
+            len(probabilities)
+        )
+    )
 
 
 def _explanation(
     probabilities: list[float],
     snapshot: dict[str, Any],
 ) -> dict[str, Any]:
-    labels = ["Local", "Empate", "Visitante"]
-    best_index = max(range(3), key=lambda index: probabilities[index])
-    confidence = probabilities[best_index]
-    entropy = _entropy(probabilities)
+
+    labels = [
+        "Local",
+        "Empate",
+        "Visitante",
+    ]
+
+    best_index = max(
+        range(3),
+        key=lambda index: probabilities[index],
+    )
+
+    confidence = probabilities[
+        best_index
+    ]
+
+    entropy = _entropy(
+        probabilities
+    )
 
     factors: list[str] = []
-    features = snapshot.get("features", {})
 
-    if float(features.get("points_form_difference", 0.0)) > 0.15:
+    features = snapshot.get(
+        "features",
+        {},
+    )
+
+    if float(
+        features.get(
+            "points_form_difference",
+            0.0,
+        )
+    ) > 0.15:
+
         factors.append(
             "La forma reciente de puntos favorece al local."
         )
-    elif float(features.get("points_form_difference", 0.0)) < -0.15:
+
+    elif float(
+        features.get(
+            "points_form_difference",
+            0.0,
+        )
+    ) < -0.15:
+
         factors.append(
             "La forma reciente de puntos favorece al visitante."
         )
 
-    if float(features.get("goals_form_difference", 0.0)) > 0.20:
+    if float(
+        features.get(
+            "goals_form_difference",
+            0.0,
+        )
+    ) > 0.20:
+
         factors.append(
             "El balance reciente de goles favorece al local."
         )
-    elif float(features.get("goals_form_difference", 0.0)) < -0.20:
+
+    elif float(
+        features.get(
+            "goals_form_difference",
+            0.0,
+        )
+    ) < -0.20:
+
         factors.append(
             "El balance reciente de goles favorece al visitante."
         )
 
-    if snapshot.get("imputed_home") or snapshot.get("imputed_away"):
+    if (
+        snapshot.get("imputed_home")
+        or snapshot.get("imputed_away")
+    ):
+
         factors.append(
             "Hay datos históricos insuficientes para al menos uno de los equipos; "
             "se aplicó la imputación definida por el modelo."
         )
 
     if not factors:
+
         factors.append(
             "La salida combina forma reciente y ventaja de local según el modelo 1X2."
         )
 
     if entropy >= 0.85:
         uncertainty = "alta"
+
     elif entropy >= 0.60:
         uncertainty = "media"
+
     else:
         uncertainty = "baja"
 
     return {
-        "selection": labels[best_index],
-        "confidence": round(confidence, 6),
+        "selection": labels[
+            best_index
+        ],
+        "confidence": round(
+            confidence,
+            6,
+        ),
         "uncertainty": uncertainty,
-        "entropy_normalized": round(entropy, 6),
+        "entropy_normalized": round(
+            entropy,
+            6,
+        ),
         "factors": factors,
     }
 
@@ -555,6 +769,7 @@ async def _team_history(
     team_id: int,
     before: str,
 ) -> list[dict[str, Any]]:
+
     rows = await supabase_get(
         "matches",
         {
@@ -562,7 +777,10 @@ async def _team_history(
                 "id,starting_at,status,home_team_id,away_team_id,"
                 "home_goals,away_goals"
             ),
-            "or": f"(home_team_id.eq.{team_id},away_team_id.eq.{team_id})",
+            "or": (
+                f"(home_team_id.eq.{team_id},"
+                f"away_team_id.eq.{team_id})"
+            ),
             "status": "in.(FT,AET,PEN)",
             "starting_at": f"lt.{before}",
             "order": "starting_at.desc,id.desc",
@@ -570,16 +788,21 @@ async def _team_history(
         },
     )
 
-    normalized: list[dict[str, Any]] = []
+    normalized: list[
+        dict[str, Any]
+    ] = []
 
     for row in rows:
+
         try:
+
             normalized.append(
                 {
                     **row,
                     "team_id": team_id,
                 }
             )
+
         except Exception:
             continue
 
@@ -595,6 +818,7 @@ async def _existing_predictions(
     match_id: int,
     model_version: str,
 ) -> list[dict[str, Any]]:
+
     return await supabase_get(
         "predictions",
         {
@@ -615,10 +839,20 @@ async def _existing_predictions(
 async def predict_match(
     match_id: int,
 ) -> dict[str, Any]:
-    model_row = await load_active_model()
-    artifact = model_row["artifact"]
 
-    if artifact.get("model_family") not in (None, MODEL_FAMILY):
+    model_row = await load_active_model()
+
+    artifact = model_row[
+        "artifact"
+    ]
+
+    if artifact.get(
+        "model_family"
+    ) not in (
+        None,
+        MODEL_FAMILY,
+    ):
+
         raise RuntimeError(
             "El modelo activo no pertenece a la familia 1X2."
         )
@@ -636,20 +870,32 @@ async def predict_match(
     )
 
     if not matches:
+
         raise RuntimeError(
             f"No se encontró el partido {match_id}."
         )
 
     match = matches[0]
 
-    if match.get("starting_at") is None:
+    if match.get(
+        "starting_at"
+    ) is None:
+
         raise RuntimeError(
             f"El partido {match_id} no tiene starting_at."
         )
 
-    home_id = int(match["home_team_id"])
-    away_id = int(match["away_team_id"])
-    kickoff = str(match["starting_at"])
+    home_id = int(
+        match["home_team_id"]
+    )
+
+    away_id = int(
+        match["away_team_id"]
+    )
+
+    kickoff = str(
+        match["starting_at"]
+    )
 
     home_history = await _team_history(
         home_id,
@@ -661,8 +907,15 @@ async def predict_match(
         kickoff,
     )
 
-    defaults = artifact.get("feature_defaults", {})
-    if not isinstance(defaults, dict):
+    defaults = artifact.get(
+        "feature_defaults",
+        {},
+    )
+
+    if not isinstance(
+        defaults,
+        dict,
+    ):
         defaults = {}
 
     features, snapshot = build_inference_features(
@@ -681,7 +934,9 @@ async def predict_match(
         snapshot,
     )
 
-    model_version = str(model_row["version"])
+    model_version = str(
+        model_row["version"]
+    )
 
     existing = await _existing_predictions(
         match_id,
@@ -689,27 +944,51 @@ async def predict_match(
     )
 
     if len(existing) >= 3:
+
         selected = max(
             existing,
-            key=lambda row: float(row.get("probability", 0.0)),
+            key=lambda row: float(
+                row.get(
+                    "probability",
+                    0.0,
+                )
+            ),
         )
 
         return {
             "ok": True,
             "match_id": match_id,
             "model_version": model_version,
-            "model_name": model_row.get("model_name"),
+            "model_name": model_row.get(
+                "model_name"
+            ),
             "market": "1X2",
-            "prediction": selected.get("selection"),
-            "probability": float(selected.get("probability")),
+            "prediction": selected.get(
+                "selection"
+            ),
+            "probability": float(
+                selected.get(
+                    "probability"
+                )
+            ),
             "probabilities": {
-                row.get("selection"): float(row.get("probability"))
+                row.get(
+                    "selection"
+                ): float(
+                    row.get(
+                        "probability"
+                    )
+                )
                 for row in existing
-                if row.get("selection") is not None
+                if row.get(
+                    "selection"
+                ) is not None
             },
             "features": snapshot,
             "explanation": explanation,
-            "calibration_temperature": float(temperature),
+            "calibration_temperature": float(
+                temperature
+            ),
             "inference_compatibility": model_row.get(
                 "inference_compatibility"
             ),
@@ -722,9 +1001,8 @@ async def predict_match(
         2: "AWAY",
     }
 
-    timestamp = datetime.now(timezone.utc).isoformat()
-
     for index in range(3):
+
         await supabase_post(
             "predictions",
             {
@@ -732,8 +1010,9 @@ async def predict_match(
                 "model_version": model_version,
                 "market": "1X2",
                 "selection": labels[index],
-                "probability": float(probabilities[index]),
-                "created_at": timestamp,
+                "probability": float(
+                    probabilities[index]
+                ),
                 "features_snapshot": {
                     **snapshot,
                     "model_version": model_version,
@@ -744,7 +1023,9 @@ async def predict_match(
                     "inference_compatibility": model_row.get(
                         "inference_compatibility"
                     ),
-                    "calibration_temperature": float(temperature),
+                    "calibration_temperature": float(
+                        temperature
+                    ),
                 },
             },
         )
@@ -760,20 +1041,34 @@ async def predict_match(
         "ok": True,
         "match_id": match_id,
         "model_version": model_version,
-        "model_name": model_row.get("model_name"),
+        "model_name": model_row.get(
+            "model_name"
+        ),
         "market": "1X2",
-        "prediction": target_name(best_index),
-        "probability": float(probabilities[best_index]),
+        "prediction": target_name(
+            best_index
+        ),
+        "probability": float(
+            probabilities[best_index]
+        ),
         "probabilities": {
-            "HOME": float(probabilities[0]),
-            "DRAW": float(probabilities[1]),
-            "AWAY": float(probabilities[2]),
+            "HOME": float(
+                probabilities[0]
+            ),
+            "DRAW": float(
+                probabilities[1]
+            ),
+            "AWAY": float(
+                probabilities[2]
+            ),
         },
         "features": snapshot,
         "explanation": explanation,
-        "calibration_temperature": float(temperature),
+        "calibration_temperature": float(
+            temperature
+        ),
         "inference_compatibility": model_row.get(
             "inference_compatibility"
         ),
         "cached": False,
-    }
+            } 
