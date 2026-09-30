@@ -6,12 +6,16 @@ import httpx
 from fastapi import FastAPI, HTTPException
 
 from app.ai_predict import predict_match, load_active_model
+from app.ai_evaluate import router as ai_router
 
 
 app = FastAPI(
     title="FÚTBOL NESTOR IA API",
     version="1.0.0"
 )
+
+app.include_router(ai_router)
+
 
 BASE_URL = "https://v3.football.api-sports.io"
 
