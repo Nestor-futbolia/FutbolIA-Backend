@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
@@ -15,7 +15,6 @@ app = FastAPI(
 )
 
 app.include_router(ai_router)
-
 
 BASE_URL = "https://v3.football.api-sports.io"
 
@@ -260,6 +259,37 @@ def clean_text(
     return text if text else None
 
 
+def parse_api_date(
+    value: Any
+) -> Optional[datetime]:
+    """Convierte una fecha ISO de API-Football a UTC."""
+
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(
+            tzinfo=timezone.utc
+        )
+
+    return parsed.astimezone(
+        timezone.utc
+    )
+
+
 # ============================================================
 # PRINCIPAL
 # ============================================================
@@ -323,6 +353,7 @@ async def fixtures(
     last: Optional[int] = None,
     status: Optional[str] = None
 ):
+
     params: dict[str, Any] = {}
 
     if league is not None:
@@ -334,17 +365,232 @@ async def fixtures(
     if team is not None:
         params["team"] = team
 
+    if status:
+        params["status"] = status
+
+    # --------------------------------------------------------
+    # CONSULTA POR FECHA EXACTA
+    # --------------------------------------------------------
+
     if date:
         params["date"] = date
 
+        return await football_get(
+            "/fixtures",
+            params
+        )
+
+    # --------------------------------------------------------
+    # PRÓXIMOS PARTIDOS
+    #
+    # Android puede seguir llamando /fixtures?next=20.
+    # Para el plan gratuito evitamos enviar `next` a
+    # API-Football y usamos un rango de fechas.
+    # --------------------------------------------------------
+
     if next is not None:
-        params["next"] = next
+
+        requested_next = max(
+            1,
+            min(next, 50)
+        )
+
+        today = datetime.now(
+            timezone.utc
+        ).date()
+
+        params["from"] = today.isoformat()
+        params["to"] = (
+            today + timedelta(days=7)
+        ).isoformat()
+
+        data = await football_get(
+            "/fixtures",
+            params
+        )
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        excluded_statuses = {
+            "FT",
+            "AET",
+            "PEN",
+            "CANC",
+            "ABD",
+            "AWD",
+            "WO",
+        }
+
+        upcoming = []
+
+        for item in data.get(
+            "response",
+            []
+        ):
+
+            fixture_info = item.get(
+                "fixture",
+                {}
+            )
+
+            fixture_date = parse_api_date(
+                fixture_info.get(
+                    "date"
+                )
+            )
+
+            status_info = fixture_info.get(
+                "status",
+                {}
+            )
+
+            status_short = status_info.get(
+                "short"
+            )
+
+            if fixture_date is None:
+                continue
+
+            if fixture_date < now:
+                continue
+
+            if status_short in excluded_statuses:
+                continue
+
+            upcoming.append(item)
+
+        upcoming.sort(
+            key=lambda item: (
+                parse_api_date(
+                    item.get(
+                        "fixture",
+                        {}
+                    ).get(
+                        "date"
+                    )
+                )
+                or datetime.max.replace(
+                    tzinfo=timezone.utc
+                )
+            )
+        )
+
+        data["response"] = upcoming[
+            :requested_next
+        ]
+
+        data["results"] = len(
+            data["response"]
+        )
+
+        return data
+
+    # --------------------------------------------------------
+    # ÚLTIMOS PARTIDOS
+    # --------------------------------------------------------
 
     if last is not None:
-        params["last"] = last
 
-    if status:
-        params["status"] = status
+        requested_last = max(
+            1,
+            min(last, 50)
+        )
+
+        today = datetime.now(
+            timezone.utc
+        ).date()
+
+        params["from"] = (
+            today - timedelta(days=14)
+        ).isoformat()
+
+        params["to"] = today.isoformat()
+
+        data = await football_get(
+            "/fixtures",
+            params
+        )
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        finished_statuses = {
+            "FT",
+            "AET",
+            "PEN",
+        }
+
+        recent = []
+
+        for item in data.get(
+            "response",
+            []
+        ):
+
+            fixture_info = item.get(
+                "fixture",
+                {}
+            )
+
+            fixture_date = parse_api_date(
+                fixture_info.get(
+                    "date"
+                )
+            )
+
+            status_info = fixture_info.get(
+                "status",
+                {}
+            )
+
+            status_short = status_info.get(
+                "short"
+            )
+
+            if fixture_date is None:
+                continue
+
+            if fixture_date > now:
+                continue
+
+            if status_short not in finished_statuses:
+                continue
+
+            recent.append(item)
+
+        recent.sort(
+            key=lambda item: (
+                parse_api_date(
+                    item.get(
+                        "fixture",
+                        {}
+                    ).get(
+                        "date"
+                    )
+                )
+                or datetime.min.replace(
+                    tzinfo=timezone.utc
+                )
+            ),
+            reverse=True
+        )
+
+        data["response"] = recent[
+            :requested_last
+        ]
+
+        data["results"] = len(
+            data["response"]
+        )
+
+        return data
+
+    # --------------------------------------------------------
+    # CONSULTA NORMAL
+    # --------------------------------------------------------
 
     return await football_get(
         "/fixtures",
