@@ -971,6 +971,15 @@ async def predict_match(
                     "probability"
                 )
             ),
+            "prediction_percentage": round(
+                float(
+                    selected.get(
+                        "probability",
+                        0.0,
+                    )
+                ) * 100,
+                6,
+            ),
             "probabilities": {
                 row.get(
                     "selection"
@@ -1051,6 +1060,12 @@ async def predict_match(
         "probability": float(
             probabilities[best_index]
         ),
+        "prediction_percentage": round(
+            float(
+                probabilities[best_index]
+            ) * 100,
+            6,
+        ),
         "probabilities": {
             "HOME": float(
                 probabilities[0]
@@ -1071,4 +1086,4 @@ async def predict_match(
             "inference_compatibility"
         ),
         "cached": False,
-            } 
+    }
