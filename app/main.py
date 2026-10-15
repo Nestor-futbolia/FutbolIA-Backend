@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 
 from app.ai_predict import predict_match, load_active_model
 from app.ai_evaluate import router as ai_router
+from app.football_data import router as football_data_router
 
 
 app = FastAPI(
@@ -15,6 +16,7 @@ app = FastAPI(
 )
 
 app.include_router(ai_router)
+app.include_router(football_data_router)
 
 BASE_URL = "https://v3.football.api-sports.io"
 
@@ -1297,3 +1299,4 @@ async def ai_predict(
             status_code=400,
             detail=str(exc)
         )
+ 
